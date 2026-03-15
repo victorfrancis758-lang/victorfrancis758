@@ -1,4 +1,0 @@
-requests
-websockets
-numpy
-pytz
