@@ -27,7 +27,7 @@ DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
 TREND_SCORE_THRESHOLD = 92
-TREND_STRENGTH_THRESHOLD = 95  # minimum 95 to send
+TREND_STRENGTH_THRESHOLD = 98  # must be 98 before sending
 
 ENTRY_DELAY = 2
 MG_STEP = 2
@@ -84,14 +84,11 @@ def trend_strength(price_list):
     if volatility == 0:
         return 0
     strength = (separation/volatility)*100
-    # Cap strength strictly at 95 or 98 if above threshold
+    # Ensure strength only triggers at exactly 98
     if strength >= 98:
         return 98
-    elif strength >= 95:
-        return 95
     else:
-        return 0  # do not send signals below 95
-        
+        return 0  # do not send signals below 98
 
 # ================================
 # TREND DETECTION
@@ -106,10 +103,10 @@ def detect_trend(price_list):
 
     strength = trend_strength(price_list)
 
-    if strength < 95:  # enforce sending only when 95 or 98
+    if strength < 98:  # only send signals when 98
         return 0, strength, None
 
-    score = min(50 + strength*0.5,100)
+    score = 99  # confidence fixed at 99
 
     direction = None
     if ema_fast and ema_slow and ema_long_fast and ema_long_slow:
@@ -268,7 +265,7 @@ async def monitor():
                             pair_check, dir_check, score_check, strength_check = pending_signal
                             score2, strength2, direction2 = detect_trend(prices[pair_check])
                             if (direction2 == dir_check and
-                                strength2 >= 95 and  # enforce 95 or 98
+                                strength2 == 98 and  # only exact 98
                                 tick_confirm[pair_check]["count"]>=TICK_CONFIRMATION):
                                 send_signal(pair_check, dir_check, score2, strength2)
                                 signal_sent_this_candle = True
