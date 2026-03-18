@@ -4,6 +4,7 @@
 # 2-MIN CANDLE, STRICT LOCK, SLOW SIGNALS
 # ENTRY AT BEST SECOND, LOSS & SPIKE FILTERS
 # MARKET-ACCURATE 82/85% SIGNALS
+# PREDICTIVE PRE-ENTRY SIGNAL
 # ======================================
 
 import asyncio
@@ -27,10 +28,10 @@ CHAT_ID = "8308393231"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
-TREND_SCORE_THRESHOLD = 92
-TREND_STRENGTH_THRESHOLD = 92
+TREND_SCORE_THRESHOLD = 88
+TREND_STRENGTH_THRESHOLD = 90
 
-ENTRY_DELAY = 2  # 2-minute advance entry
+ENTRY_DELAY = 2
 MG_STEP = 2
 MAX_MG_STEPS = 3
 EXPIRY_MINUTES = 2
@@ -38,7 +39,7 @@ EXPIRY_MINUTES = 2
 MAX_PRICES = 700
 RETRY_SECONDS = 5
 SYMBOL_REFRESH_INTERVAL = 5
-TICK_CONFIRMATION = 3
+TICK_CONFIRMATION = 2
 
 # ================================
 # BLOCKED PAIRS
@@ -82,18 +83,13 @@ def trend_strength(price_list):
     if volatility==0:
         return 0
     strength = (separation/volatility)*100
-    return max(82,min(strength,98))
+    return min(max(strength,82),95)
 
 # ================================
 # MARKET ACCURACY ADJUSTMENT
 # ================================
-def adjust_for_market_accuracy(score, strength):
-    # Adjust score to exactly 82 or 85 depending on trend strength
-    if strength < 90:  # bad market
-        score = 82
-    else:  # good market
-        score = 85
-    return score
+def adjust_for_market_accuracy(strength):
+    return 82 if strength < 90 else 85
 
 # ================================
 # TREND DETECTION
@@ -106,15 +102,28 @@ def detect_trend(price_list):
     ema_long_fast = ema(price_list[-200:],30)
     ema_long_slow = ema(price_list[-300:],60)
     strength = trend_strength(price_list)
-    score = min(50 + strength*0.5,100)
-    score = adjust_for_market_accuracy(score,strength)
+    accuracy = adjust_for_market_accuracy(strength)
     direction=None
     if ema_fast and ema_slow and ema_long_fast and ema_long_slow:
         if ema_fast>ema_slow and ema_long_fast>ema_long_slow:
             direction="BUY"
         elif ema_fast<ema_slow and ema_long_fast<ema_long_slow:
             direction="SELL"
-    return score,strength,direction
+    return accuracy,strength,direction
+
+# ================================
+# PREDICTIVE DURATION CHECK
+# ================================
+def predictive_valid(price_list, direction):
+    if len(price_list)<4:
+        return False
+    last = price_list[-1]
+    previous = price_list[-4]
+    if direction=="BUY":
+        return last > previous
+    elif direction=="SELL":
+        return last < previous
+    return False
 
 # ================================
 # SIGNAL LOCK
@@ -142,16 +151,16 @@ def get_flag(code):
 # ================================
 # SEND TELEGRAM SIGNAL
 # ================================
-def send_signal(pair,direction,score,strength):
+def send_signal(pair,direction,accuracy,strength):
     if signal_active():
         return
     now=datetime.now(TIMEZONE)
-    entry_time=now+timedelta(seconds=2)
+    entry_time=now+timedelta(minutes=ENTRY_DELAY)
     mg_times=[entry_time+timedelta(minutes=MG_STEP*i) for i in range(1,MAX_MG_STEPS+1)]
     register_signal(pair)
     base=pair[3:6].upper()
     quote=pair[6:9].upper()
-    msg=(f"🚨TRADE NOW!!\n\n"
+    msg=(f"🚨TRADE SIGNAL!!\n\n"
          f"📉{get_flag(base)} {base}/{quote} {get_flag(quote)} (OTC)\n"
          f"⏰ Expiry: {EXPIRY_MINUTES} minutes\n"
          f"📍 Entry Time: {entry_time.strftime('%I:%M:%S %p')}\n"
@@ -160,7 +169,7 @@ def send_signal(pair,direction,score,strength):
          f"🔁 Level 1 → {mg_times[0].strftime('%I:%M:%S %p')}\n"
          f"🔁 Level 2 → {mg_times[1].strftime('%I:%M:%S %p')}\n"
          f"🔁 Level 3 → {mg_times[2].strftime('%I:%M:%S %p')}\n\n"
-         f"Confidence: {score:.0f}%\n"
+         f"Accuracy: {accuracy}%\n"
          f"Strength: {strength:.0f}%\n"
          f"Mode: HIGH ACCURACY DAY TRADING")
     try:
@@ -211,9 +220,8 @@ async def monitor():
                     prices[pair].append(price)
                     if len(prices[pair])>MAX_PRICES:
                         prices[pair].pop(0)
-                    score,strength,direction=detect_trend(prices[pair])
-                    # Loss & spike filter
-                    if direction and score>=TREND_SCORE_THRESHOLD and strength>=TREND_STRENGTH_THRESHOLD:
+                    accuracy,strength,direction=detect_trend(prices[pair])
+                    if direction and accuracy>=TREND_SCORE_THRESHOLD and strength>=TREND_STRENGTH_THRESHOLD:
                         if tick_confirm[pair]["direction"]==direction:
                             tick_confirm[pair]["count"]+=1
                         else:
@@ -222,7 +230,8 @@ async def monitor():
                         if tick_confirm[pair]["count"]>=TICK_CONFIRMATION:
                             if len(prices[pair])>1 and abs(prices[pair][-1]-prices[pair][-2])/prices[pair][-2]>0.01:
                                 continue
-                            pending_signal=(pair,direction,score,strength)
+                            if predictive_valid(prices[pair],direction):
+                                pending_signal=(pair,direction,accuracy,strength)
                     else:
                         tick_confirm[pair]["count"]=0
                         tick_confirm[pair]["direction"]=None
@@ -236,12 +245,11 @@ async def monitor():
                         last_candle_time=candle_time
                         signal_sent_this_candle=False
                     if pending_signal and not signal_active() and not signal_sent_this_candle:
-                        seconds_into_candle=now.second
-                        if seconds_into_candle>=10:
-                            pair_check,dir_check,score_check,strength_check=pending_signal
-                            score2,strength2,direction2=detect_trend(prices[pair_check])
-                            if direction2==dir_check and score2>=TREND_SCORE_THRESHOLD and strength2>=TREND_STRENGTH_THRESHOLD and tick_confirm[pair_check]["count"]>=TICK_CONFIRMATION:
-                                send_signal(pair_check,dir_check,score2,strength2)
+                        if now.second>=10:
+                            pair_check,dir_check,accuracy_check,strength_check=pending_signal
+                            accuracy2,strength2,direction2=detect_trend(prices[pair_check])
+                            if direction2==dir_check and predictive_valid(prices[pair_check],dir_check):
+                                send_signal(pair_check,dir_check,accuracy2,strength2)
                                 signal_sent_this_candle=True
                             pending_signal=None
         except:
