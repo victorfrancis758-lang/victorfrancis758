@@ -63,16 +63,30 @@ def detect_trend(p):
     return None
 
 # ----------------------
-# STABLE TREND CHECK
+# STABLE TREND & PULLBACK CHECK
 # ----------------------
-def stable_move(p, direction):
+def is_stable_with_no_pullback(p, direction):
+    """
+    Checks:
+    - Trend stability over observation ticks
+    - Detects pullback and waits until trend resumes
+    """
     if len(p) < OBSERVATION_TICKS + 5:
         return False
+
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
+    # Pullback detection: temporary reversal in last few ticks
+    pullback = False
+    if direction == "BUY" and np.any(last_diff < 0):
+        pullback = True
+    if direction == "SELL" and np.any(last_diff > 0):
+        pullback = True
+
+    # Trend must be stable and no pullback
     if direction == "BUY":
-        return np.all(last_diff > 0)
-    if direction == "SELL":
-        return np.all(last_diff < 0)
+        return np.all(last_diff > 0) and not pullback
+    elif direction == "SELL":
+        return np.all(last_diff < 0) and not pullback
     return False
 
 # ----------------------
@@ -208,7 +222,7 @@ async def monitor():
                         if not direction:
                             continue
 
-                        if stable_move(prices[pair], direction):
+                        if is_stable_with_no_pullback(prices[pair], direction):
                             acc = calculate_accuracy(prices[pair], direction)
                             send_asset(pair)
                             send_final(pair, direction, acc)
