@@ -1,17 +1,4 @@
-# WebSocket connections
 websockets==11.0.3
-
-# SignalR client for weekend WebSocket
 signalrcore==1.0.2
-
-# HTTP requests for Telegram
 requests==2.31.0
-
-# Timezone support
-pytz==2023.3
-
-# Numerical calculations
-numpy==1.26.0
-
-# Optional: logging utilities
-loguru==0.7.0
+python-dotenv==1.0.0
