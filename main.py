@@ -2,11 +2,15 @@ import json
 import requests
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 import time
+import logging
 
 # === REQUIRED CONFIG ===
-SIGNALR_HUB_URL = "https://YOUR_REAL_SIGNALR_URL/otcHub"  # Replace with your real SignalR hub
-TELEGRAM_BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"  # Your Telegram bot token
-TELEGRAM_CHAT_ID = "8308393231"  # Your Telegram chat ID
+SIGNALR_HUB_URL = "https://demo-market-signalr-server.com/otcHub"  # OTC SignalR hub URL
+TELEGRAM_BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
+TELEGRAM_CHAT_ID = "8308393231"
+
+# Configure logging properly
+logging.basicConfig(level=logging.INFO)
 
 # Send message to Telegram
 def send_telegram_message(message):
@@ -25,7 +29,7 @@ def on_tick_received(tick):
 # Build SignalR connection
 hub_connection = HubConnectionBuilder()\
     .with_url(SIGNALR_HUB_URL)\
-    .configure_logging(lambda level, message: print(f"[SignalR] {message}"))\
+    .configure_logging(logging.INFO)\
     .build()
 
 # Subscribe to "tick" event
