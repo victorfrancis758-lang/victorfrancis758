@@ -1,53 +1,44 @@
-import asyncio
 import json
 import requests
 from signalrcore.hub_connection_builder import HubConnectionBuilder
+import time
 
-# --- Telegram ---
-TELEGRAM_BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
-TELEGRAM_CHAT_ID = "8308393231"
+# === REQUIRED CONFIG ===
+SIGNALR_HUB_URL = "https://YOUR_REAL_SIGNALR_URL/otcHub"  # Replace with your real SignalR hub
+TELEGRAM_BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"  # Your Telegram bot token
+TELEGRAM_CHAT_ID = "8308393231"  # Your Telegram chat ID
 
+# Send message to Telegram
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        requests.post(url, data=data)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
     except Exception as e:
-        print("Telegram error:", e)
+        print(f"[Error] Failed to send Telegram message: {e}")
 
-# --- WebSocket URL ---
-WEEKEND_WS_URL = "YOUR_WEEKEND_SIGNALR_HUB_URL"  # replace with actual
+# Tick handler
+def on_tick_received(tick):
+    message = f"New Tick: {json.dumps(tick)}"
+    print(message)
+    send_telegram_message(message)
 
-# --- OTC Pairs for weekend ---
-OTC_PAIRS = [
-    "OTC-USDJPY", "OTC-EURUSD", "OTC-GBPUSD", "OTC-AUDUSD", "OTC-USDCAD",
-    "OTC-EURJPY", "OTC-GBPJPY", "OTC-AUDJPY", "OTC-USDCHF", "OTC-EURAUD",
-    "OTC-EURGBP", "OTC-GBPCHF", "OTC-AUDNZD", "OTC-USDNOK", "OTC-USDSEK",
-    "OTC-USDSGD", "OTC-EURNZD", "OTC-GBPNZD", "OTC-NZDUSD", "OTC-CADJPY",
-    "OTC-EURCAD", "OTC-GBPCA", "OTC-AUDCAD", "OTC-AUDCHF", "OTC-NZDJPY",
-    "OTC-NZDCHF", "OTC-CADCHF", "OTC-EURCHF", "OTC-GBPZAR", "OTC-USDZAR"
-]
-
-# --- Connect to SignalR ---
+# Build SignalR connection
 hub_connection = HubConnectionBuilder()\
-    .with_url(WEEKEND_WS_URL)\
+    .with_url(SIGNALR_HUB_URL)\
+    .configure_logging(lambda level, message: print(f"[SignalR] {message}"))\
     .build()
 
-def on_tick_received(tick_data):
-    try:
-        tick = json.loads(tick_data)
-        send_telegram_message(f"Tick: {tick}")
-    except Exception as e:
-        print("Tick parse error:", e)
+# Subscribe to "tick" event
+hub_connection.on("tick", on_tick_received)
 
-for pair in OTC_PAIRS:
-    hub_connection.on(f"{pair}_tick", on_tick_received)
-
+# Start connection
 hub_connection.start()
-print("Connected to weekend WebSocket... streaming all ticks")
+print("✅ SignalR Hub connected. Streaming ticks now...")
 
+# Keep the script running
 try:
     while True:
-        asyncio.sleep(1)
+        time.sleep(1)
 except KeyboardInterrupt:
+    print("Stopping...")
     hub_connection.stop()
