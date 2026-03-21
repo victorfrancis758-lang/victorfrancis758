@@ -1,5 +1,19 @@
-requests==2.31.0
+# Required packages for OTC WebSocket tick streaming
+
+# SignalR client for weekend WebSocket
+signalrcore==0.10.0
+
+# WebSocket handling for Deriv
 websockets==11.0.3
-numpy==1.26.0
+
+# HTTP requests (for Telegram API)
+requests==2.31.0
+
+# Timezone and date management
 pytz==2023.3
-Pillow==10.0.1
+
+# Numerical computations
+numpy==1.26.2
+
+# Async utilities
+asyncio==3.4.3
