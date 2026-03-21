@@ -1,17 +1,39 @@
-import time
+import asyncio
+import json
 import requests
-import logging
 from signalrcore.hub_connection_builder import HubConnectionBuilder
+import websockets
+from collections import deque
+import logging
+from datetime import datetime
+import pytz
 
 # ----------------------
 # CONFIG
 # ----------------------
 BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
 CHAT_ID = "8308393231"
-BIQUOTE_HUB = "https://biquote.io/hubs/tick"
+DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+WEEKEND_WS = "https://biquote.io/hubs/tick"  # SignalR weekend WebSocket
+TIMEZONE = pytz.timezone("Africa/Lagos")
+
+# Top 30 popular OTC pairs
+OTC_PAIRS = [
+    "frxAUDCAD", "frxAUDCHF", "frxAUDJPY", "frxAUDNZD", "frxAUDUSD",
+    "frxCADCHF", "frxCADJPY", "frxCHFJPY", "frxEURAUD", "frxEURCAD",
+    "frxEURCHF", "frxEURGBP", "frxEURJPY", "frxEURNZD", "frxEURUSD",
+    "frxGBPAUD", "frxGBPCAD", "frxGBPCHF", "frxGBPJPY", "frxGBPNZD",
+    "frxGBPUSD", "frxNZDCAD", "frxNZDCHF", "frxNZDJPY", "frxNZDUSD",
+    "frxUSDCAD", "frxUSDCHF", "frxUSDJPY", "frxUSDNOK", "frxUSDSEK"
+]
 
 # ----------------------
-# TELEGRAM FUNCTION
+# LOGGING
+# ----------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+# ----------------------
+# TELEGRAM
 # ----------------------
 def send_telegram(msg):
     try:
@@ -21,51 +43,67 @@ def send_telegram(msg):
             timeout=5
         )
     except Exception as e:
-        logging.warning(f"Telegram error: {e}")
+        logging.warning(f"Failed to send Telegram message: {e}")
 
 # ----------------------
-# SIGNALR HANDLER
+# DERIV WebSocket (weekdays)
 # ----------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+async def deriv_stream():
+    async with websockets.connect(DERIV_WS) as ws:
+        for pair in OTC_PAIRS:
+            await ws.send(json.dumps({"ticks": pair, "subscribe": 1}))
+        logging.info("Subscribed to all OTC pairs on Deriv WebSocket")
 
-hub_connection = HubConnectionBuilder() \
-    .with_url(BIQUOTE_HUB) \
-    .with_automatic_reconnect({
-        "type": "raw",
-        "keep_alive_interval": 10,
-        "reconnect_interval": 5
-    }) \
-    .build()
+        async for msg in ws:
+            try:
+                data = json.loads(msg)
+                if "tick" in data:
+                    pair = data["tick"]["symbol"]
+                    price = data["tick"]["quote"]
+                    msg_text = f"Deriv Tick: {pair} = {price}"
+                    send_telegram(msg_text)
+                    logging.info(msg_text)
+            except Exception as e:
+                logging.warning(f"Error parsing tick: {e}")
 
-# This event fires whenever a tick arrives
-def on_receive_tick(tick):
-    try:
-        symbol = tick.get("symbol")
-        bid = tick.get("bid")
-        ask = tick.get("ask")
-        last = tick.get("last")
-        if symbol:
-            message = f"Tick | {symbol} | bid={bid} ask={ask} last={last}"
-            logging.info(message)
-            send_telegram(message)
-    except Exception as e:
-        logging.warning(f"Tick parse error: {e}")
+# ----------------------
+# WEEKEND SignalR WebSocket
+# ----------------------
+def weekend_stream():
+    hub_connection = HubConnectionBuilder()\
+        .with_url(WEEKEND_WS)\
+        .build()
 
-# Register the event
-hub_connection.on("ReceiveTick", on_receive_tick)
+    def on_message(msg):
+        try:
+            data = json.loads(msg)
+            pair = data.get("pair")
+            price = data.get("price")
+            if pair and price is not None:
+                msg_text = f"Weekend Tick: {pair} = {price}"
+                send_telegram(msg_text)
+                logging.info(msg_text)
+        except Exception as e:
+            logging.warning(f"Error parsing weekend tick: {e}")
 
-# Connect
-hub_connection.start()
-time.sleep(1)
+    hub_connection.on("tick", on_message)
+    hub_connection.start()
 
-# Subscribe to everything (empty list means you can adjust later)
-hub_connection.send("Subscribe", [[]])
+# ----------------------
+# MAIN
+# ----------------------
+async def main():
+    now = datetime.now(TIMEZONE)
+    weekday = now.weekday()  # 0=Mon, 6=Sun
 
-logging.info("Connected and subscribed to tick stream...")
+    if weekday in [5, 6]:  # Weekend
+        logging.info("Starting weekend SignalR stream")
+        weekend_stream()
+        while True:
+            await asyncio.sleep(1)
+    else:  # Weekday
+        logging.info("Starting weekday Deriv WebSocket stream")
+        await deriv_stream()
 
-# Keep the script running
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    hub_connection.stop()
+if __name__ == "__main__":
+    asyncio.run(main())
