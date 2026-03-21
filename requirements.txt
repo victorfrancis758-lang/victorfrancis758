@@ -2,7 +2,7 @@
 websockets==11.0.3
 
 # SignalR client for weekend WebSocket
-signalrcore==0.0.25
+signalrcore==1.0.2
 
 # HTTP requests for Telegram
 requests==2.31.0
