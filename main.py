@@ -2,11 +2,11 @@ import asyncio
 import json
 import requests
 import websockets
-import numpy as np
 from datetime import datetime, timedelta
-import pytz
-import logging
 from collections import deque, defaultdict
+import pytz
+import numpy as np
+import logging
 
 # ----------------------
 # CONFIG
@@ -15,256 +15,191 @@ BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
 CHAT_ID = "8308393231"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
+
 EXPIRY_MINUTES = 5
+ENTRY_DELAY = 2
 MAX_PRICES = 5000
-OBSERVATION_TICKS = 15
-PRE_SIGNAL_OBSERVATION = 120  # seconds
-BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
-LOSS_FREEZE_COUNT = 2
-MIN_ACCURACY = 82
-MAX_ACCURACY = 95
-MIN_SIGNALS_PER_HOUR = 1
-MAX_SIGNALS_PER_HOUR = 2
-MIN_SIGNAL_INTERVAL = 1800  # 30 minutes minimum between signals
-EXPLOSION_THRESHOLD = 0.01
-EXPLOSION_BOOST = 5
+
+# 15 crypto pairs to monitor
+CRYPTO_PAIRS = [
+    "cryBTCUSD","cryETHUSD","cryLTCUSD","cryXRPUSD","cryBCHUSD",
+    "cryEOSUSD","cryTRXUSD","cryADAUSD","cryBNBUSD","cryDOTUSD",
+    "cryLINKUSD","cryXLMUSD","cryDOGEUSD","cryUNIUSD","crySOLUSD"
+]
 
 # ----------------------
-# GLOBAL STATE
+# STATE
 # ----------------------
-prices = {}
-historical_memory = {}
-signal_history = defaultdict(list)
-pair_losses = defaultdict(int)
-adaptive_weights = {"ema":0.25,"momentum":0.25,"volatility":0.25,"pullback":0.25}
-active_pair = None
-last_signal_time = datetime.min.replace(tzinfo=TIMEZONE)
-signals_sent_this_hour = 0
+prices = defaultdict(lambda: deque(maxlen=MAX_PRICES))
+tick_confirm = defaultdict(lambda: {"dir": None, "count": 0})
+lock_until = None
+
+logging.basicConfig(level=logging.INFO)
 
 # ----------------------
-# LOGGING
-# ----------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-
-# ----------------------
-# EMA
+# EMA CALCULATION
 # ----------------------
 def ema(data, period):
-    if len(data) < period: return None
+    if len(data) < period:
+        return None
     k = 2 / (period + 1)
     val = data[0]
-    for p in data: val = p * k + val * (1 - k)
+    for p in data:
+        val = p * k + val * (1 - k)
     return val
 
 # ----------------------
-# TREND DETECTION
+# ANALYSIS ENGINE
 # ----------------------
-def detect_trend(p):
-    if len(p) < 50: return None
-    e1 = ema(p[-10:],3)
-    e2 = ema(p[-20:],5)
-    e3 = ema(p[-30:],8)
-    e4 = ema(p[-50:],13)
-    if not all([e1,e2,e3,e4]): return None
-    if e1>e2 and e3>e4: return "BUY"
-    if e1<e2 and e3<e4: return "SELL"
-    return None
+def analyze_pair(p):
+    if len(p) < 60:
+        return None, None, None
 
-# ----------------------
-# PULLBACK & STABLE CHECK
-# ----------------------
-def is_stable_and_no_pullback(p,direction):
-    if len(p)<OBSERVATION_TICKS+5: return False
-    last_diff = np.diff(p[-OBSERVATION_TICKS:])
-    if direction=="BUY": return np.all(last_diff>0)
-    if direction=="SELL": return np.all(last_diff<0)
-    return False
+    p = list(p)
+    e1 = ema(p[-10:], 3)
+    e2 = ema(p[-20:], 5)
+    e3 = ema(p[-30:], 8)
+    e4 = ema(p[-50:], 13)
 
-# ----------------------
-# MARKET NOISE FILTER
-# ----------------------
-def is_market_stable(p):
-    if len(p)<30: return False
+    if not all([e1, e2, e3, e4]):
+        return None, None, None
+
+    direction = None
+    score = 0
+
+    if e1 > e2 > e3 > e4:
+        direction = "BUY"
+        score += 30
+    elif e1 < e2 < e3 < e4:
+        direction = "SELL"
+        score += 30
+
+    if not direction:
+        return None, None, None
+
+    diff = np.diff(p[-10:])
+    if direction == "BUY" and np.sum(diff > 0) >= 8:
+        score += 25
+    elif direction == "SELL" and np.sum(diff < 0) >= 8:
+        score += 25
+    else:
+        return None, None, None
+
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    return std/mean < 0.005
+    if std / mean < 0.004:
+        score += 20
+    else:
+        return None, None, None
+
+    move = abs(p[-1] - p[-15])
+    noise = np.std(p[-15:])
+    if move > noise * 2:
+        score += 20
+
+    last = np.diff(p[-3:])
+    if direction == "BUY" and np.all(last > 0):
+        score += 15
+    elif direction == "SELL" and np.all(last < 0):
+        score += 15
+    else:
+        return None, None, None
+
+    if score >= 90:
+        return direction, 95, "EXPLOSIVE MOVE"
+    elif score >= 80:
+        return direction, 90, "STRONG TREND"
+    elif score >= 70:
+        return direction, 85, "STABLE TREND"
+
+    return None, None, None
 
 # ----------------------
-# EXPLOSION DETECTION
+# TELEGRAM SIGNAL
 # ----------------------
-def detect_explosion(p,direction):
-    if len(p)<OBSERVATION_TICKS: return False
-    recent_change = (p[-1]-p[-OBSERVATION_TICKS])/p[-OBSERVATION_TICKS]
-    if direction=="BUY" and recent_change >= EXPLOSION_THRESHOLD: return True
-    if direction=="SELL" and recent_change <= -EXPLOSION_THRESHOLD: return True
-    return False
+def send_signal(pair, direction, acc, trend):
+    entry_time = datetime.now(TIMEZONE) + timedelta(minutes=ENTRY_DELAY)
+    arrow = "⬆️" if direction == "BUY" else "⬇️"
 
-# ----------------------
-# ACCURACY CALCULATION WITH EXPLOSION BOOST
-# ----------------------
-def calculate_accuracy(p,direction):
-    score=0
-    e1 = ema(p[-10:],3)
-    e2 = ema(p[-20:],5)
-    e3 = ema(p[-30:],8)
-    e4 = ema(p[-50:],13)
-    if direction=="BUY" and e1>e2 and e3>e4: score+=adaptive_weights["ema"]*100
-    if direction=="SELL" and e1<e2 and e3<e4: score+=adaptive_weights["ema"]*100
-    diff = np.diff(p[-5:])
-    if direction=="BUY" and np.all(diff>0): score+=adaptive_weights["momentum"]*100
-    if direction=="SELL" and np.all(diff<0): score+=adaptive_weights["momentum"]*100
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
-    if std/mean < 0.005: score+=adaptive_weights["volatility"]*100
-    last_diff = np.diff(p[-OBSERVATION_TICKS:])
-    if direction=="BUY" and np.all(last_diff>0): score+=adaptive_weights["pullback"]*100
-    if direction=="SELL" and np.all(last_diff<0): score+=adaptive_weights["pullback"]*100
+    msg = f"""
+🔥 ELITE SIGNAL 🔥
 
-    # --- Explosion boost ---
-    if detect_explosion(p,direction):
-        logging.info(f"Explosion boost applied for {direction}")
-        score += EXPLOSION_BOOST
-
-    accuracy = min(score,100)
-    return max(MIN_ACCURACY,min(accuracy,MAX_ACCURACY))
-
-# ----------------------
-# ADAPTIVE LEARNING
-# ----------------------
-def update_adaptive_weights(pair,direction,result):
-    signal_history[pair].append(result)
-    if len(signal_history[pair])>100: signal_history[pair].pop(0)
-    for k in adaptive_weights:
-        if result: adaptive_weights[k]=min(0.4,adaptive_weights[k]+0.01)
-        else: adaptive_weights[k]=max(0.15,adaptive_weights[k]-0.01)
-    if not result: pair_losses[pair]+=1
-    else: pair_losses[pair]=0
-    logging.info(f"Adaptive weights: {adaptive_weights} | Pair losses: {dict(pair_losses)}")
-
-# ----------------------
-# TELEGRAM
-# ----------------------
-def send_asset(pair, move_type="Steady Trend"):
-    msg=f"""SIGNAL ⚠️
-Asset: {pair}_otc
-Expiration: M{EXPIRY_MINUTES}
-Move Type: {move_type}
-Observing market for stable move..."""
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Asset observation started: {pair} ({move_type})")
-
-def send_final(pair,direction,acc, move_type="Steady Trend"):
-    arrow="⬆️" if direction=="BUY" else "⬇️"
-    msg=f"""SIGNAL {arrow}
-Asset: {pair}_otc
-Payout: 92%
+Pair: {pair}
+Direction: {direction} {arrow}
+Type: {trend}
 Accuracy: {acc}%
-Expiration: M{EXPIRY_MINUTES}
-Move Type: {move_type}"""
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}% ({move_type})")
-
-# ----------------------
-# LOAD SYMBOLS
-# ----------------------
-async def load_symbols():
+Entry Time: {entry_time.strftime('%H:%M:%S')}
+Expiry: {EXPIRY_MINUTES} min
+"""
     try:
-        async with websockets.connect(DERIV_WS) as ws:
-            await ws.send(json.dumps({"active_symbols":"brief"}))
-            res = json.loads(await ws.recv())
-            return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg}
+        )
+        logging.info(f"SENT: {pair} {direction} {acc}%")
     except Exception as e:
-        logging.warning(f"Failed to load symbols: {e}")
-        return []
+        logging.error(e)
 
 # ----------------------
-# MONITOR LOOP
+# MAIN LOOP
 # ----------------------
-async def monitor():
-    global active_pair, last_signal_time, signals_sent_this_hour
+async def main():
+    global lock_until, tick_confirm
 
     while True:
         try:
-            now = datetime.now(TIMEZONE)
-            if now.minute==0 and now.second<5:
-                signals_sent_this_hour=0
+            async with websockets.connect(DERIV_WS) as ws:
 
-            symbols = await load_symbols()    
-            if not symbols or active_pair:    
-                await asyncio.sleep(5)    
-                continue    
+                # Subscribe to crypto pairs
+                for s in CRYPTO_PAIRS:
+                    await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
-            for s in symbols:    
-                if s not in prices: prices[s]=deque(maxlen=MAX_PRICES)    
-                if s not in historical_memory: historical_memory[s]=deque(maxlen=1000)    
+                async for msg in ws:
+                    data = json.loads(msg)
 
-            async with websockets.connect(DERIV_WS) as ws:    
-                for pair in symbols: await ws.send(json.dumps({"ticks":pair,"subscribe":1}))    
+                    if "tick" not in data:
+                        continue
 
-                async for msg in ws:    
-                    try:    
-                        data=json.loads(msg)    
-                        if "tick" not in data: continue    
+                    pair = data["tick"]["symbol"]
+                    price = data["tick"]["quote"]
+                    prices[pair].append(price)
 
-                        pair=data["tick"]["symbol"]    
-                        price=data["tick"]["quote"]    
+                    # Check if system is locked waiting for previous signal to expire
+                    if lock_until and datetime.now(TIMEZONE) < lock_until:
+                        continue
 
-                        if pair_losses[pair]>=LOSS_FREEZE_COUNT: continue    
-                        prices[pair].append(price)    
-                        historical_memory[pair].append(price)    
+                    direction, acc, trend = analyze_pair(prices[pair])
 
-                        if active_pair: continue    
+                    if not direction:
+                        tick_confirm[pair] = {"dir": None, "count": 0}
+                        continue
 
-                        # Ensure 1–2 signals per hour    
-                        seconds_since_last = (now-last_signal_time).total_seconds()    
-                        if seconds_since_last<MIN_SIGNAL_INTERVAL or signals_sent_this_hour>=MAX_SIGNALS_PER_HOUR:    
-                            continue    
+                    if tick_confirm[pair]["dir"] == direction:
+                        tick_confirm[pair]["count"] += 1
+                    else:
+                        tick_confirm[pair] = {"dir": direction, "count": 1}
 
-                        direction=detect_trend(list(prices[pair]))    
-                        if not direction: continue    
-                        if not is_stable_and_no_pullback(list(prices[pair]),direction): continue    
-                        if not is_market_stable(list(prices[pair])): continue    
+                    # Require 3 confirmations before sending
+                    if tick_confirm[pair]["count"] < 3:
+                        continue
 
-                        # Determine move type    
-                        move_type = "Big Move" if detect_explosion(list(prices[pair]),direction) else "Steady Trend"    
+                    # Entry delay to match market timing
+                    await asyncio.sleep(ENTRY_DELAY)
 
-                        # Pre-signal observation    
-                        observation_start = datetime.now(TIMEZONE)    
-                        pre_prices = list(prices[pair])    
-                        while (datetime.now(TIMEZONE)-observation_start).total_seconds()<PRE_SIGNAL_OBSERVATION:    
-                            await asyncio.sleep(1)    
-                            pre_prices.append(prices[pair][-1])    
-                            if not is_stable_and_no_pullback(pre_prices,direction): break    
-                        else:    
-                            acc = calculate_accuracy(pre_prices,direction)    
-                            if acc<MIN_ACCURACY: continue    
+                    # Send signal
+                    send_signal(pair, direction, acc, trend)
 
-                            active_pair=pair    
-                            signals_sent_this_hour+=1    
-                            last_signal_time=datetime.now(TIMEZONE)    
+                    # Lock system until current signal expires
+                    lock_until = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
 
-                            send_asset(pair, move_type)    
-                            await asyncio.sleep(2)    
-                            send_final(pair,direction,acc, move_type)    
+                    # Reset confirmations
+                    tick_confirm[pair] = {"dir": None, "count": 0}
 
-                            # Wait for expiry    
-                            await asyncio.sleep(EXPIRY_MINUTES*60)    
-
-                            final_price = historical_memory[pair][-1]    
-                            result=(direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])    
-                            update_adaptive_weights(pair,direction,result)    
-
-                            active_pair=None    
-                            prices[pair].clear()    
-
-                    except Exception as e_tick:    
-                        logging.error(f"Tick error: {e_tick}")    
-
-        except Exception as e_outer:    
-            logging.error(f"Main loop error: {e_outer}")    
+        except Exception as e:
+            logging.error(f"Reconnect: {e}")
             await asyncio.sleep(5)
 
 # ----------------------
 # RUN
 # ----------------------
-asyncio.run(monitor())
+asyncio.run(main())
