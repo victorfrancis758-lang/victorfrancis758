@@ -36,6 +36,7 @@ signal_count_hour = 0
 last_hour = None
 pending_signal = None
 signal_ready = False
+tick_confirmations = defaultdict(int)  # Track consecutive confirmations
 
 # ----------------------
 # LOGGING
@@ -165,9 +166,13 @@ async def system_loop():
         else:
             symbols = await get_symbols()
 
+        # ----------------------
+        # Safe WebSocket connection loop
+        # ----------------------
         while True:
             try:
                 async with websockets.connect(DERIV_WS) as ws:
+                    # Subscribe to all symbols
                     for s in symbols:
                         await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
@@ -181,7 +186,6 @@ async def system_loop():
                         price = data["tick"]["quote"]
                         prices[pair].append(price)
 
-                        # Ensure enough data
                         if len(prices[pair]) < 60:
                             continue
 
@@ -190,22 +194,25 @@ async def system_loop():
                         if not direction or score < 75:
                             pending_signal = None
                             signal_ready = False
+                            tick_confirmations[pair] = 0
                             continue
 
-                        # ✅ Timing logic: only mark signal ready after trend stabilizes for 2 ticks
+                        # ✅ 3-tick trend stabilization
                         if pending_signal and pending_signal[0] == pair and pending_signal[1] == direction:
-                            signal_ready = True
+                            tick_confirmations[pair] += 1
                         else:
                             pending_signal = (pair, direction, score)
-                            signal_ready = False
+                            tick_confirmations[pair] = 1
 
-                        # Check if ready to send
+                        signal_ready = tick_confirmations[pair] >= 3  # Require 3 consecutive ticks
+
+                        # Send signal only when ready
                         if signal_ready:
                             # Enforce 2 signals per hour
                             if signal_count_hour >= 2:
                                 continue
 
-                            # Ensure minimum interval between signals
+                            # Minimum interval between signals
                             if (now - last_signal_time).total_seconds() < EXPIRY_MINUTES * 60:
                                 continue
 
@@ -219,6 +226,7 @@ async def system_loop():
 
                             pending_signal = None
                             signal_ready = False
+                            tick_confirmations[pair] = 0
 
                             # Wait for expiry before next signal
                             await asyncio.sleep(EXPIRY_MINUTES * 60)
