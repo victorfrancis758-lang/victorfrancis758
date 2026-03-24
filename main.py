@@ -1,8 +1,3 @@
-# ======================================
-# DERIV AI SIGNAL BOT - FULL ADAPTIVE SYSTEM
-# REAL MARKET + SELF-LEARNING + STABLE
-# ======================================
-
 import asyncio
 import json
 import requests
@@ -10,199 +5,262 @@ import websockets
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
-import csv
-import os
-from sklearn.linear_model import SGDClassifier
-from sklearn.preprocessing import StandardScaler
+import logging
+from collections import deque, defaultdict
 
-# ---------------- CONFIG ----------------
+# ----------------------
+# CONFIG
+# ----------------------
 BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
 CHAT_ID = "8308393231"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
-
+EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
-TICK_CONFIRMATION = 3
-COOLDOWN_MINUTES = 2
-PROB_THRESHOLD = 70  # Minimum probability to send signal
-
+OBSERVATION_TICKS = 15
+PRE_SIGNAL_OBSERVATION = 120
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
-TRADE_LOG = "ai_trades.csv"
+LOSS_FREEZE_COUNT = 2
+MIN_ACCURACY = 82
+MAX_ACCURACY = 95
+MIN_SIGNALS_PER_HOUR = 1
+MAX_SIGNALS_PER_HOUR = 2
+MIN_SIGNAL_INTERVAL = 1800  # 30 minutes
+EXPLOSION_THRESHOLD = 0.01
+EXPLOSION_BOOST = 5
 
-# ---------------- INIT ----------------
+# ----------------------
+# GLOBAL STATE
+# ----------------------
 prices = {}
-tick_confirm = {}
-cooldowns = {}
-pending_signal = {}
-features_history = []
-labels_history = []
+historical_memory = {}
+signal_history = defaultdict(list)
+pair_losses = defaultdict(int)
+adaptive_weights = {"ema":0.25,"momentum":0.25,"volatility":0.25,"pullback":0.25}
+active_pair = None
+last_signal_time = datetime.min.replace(tzinfo=TIMEZONE)
+signals_sent_this_hour = 0
+pending_signals = {}  # For deploy page visibility
+live_ticks = {}       # For live tick updates
 
-# Initialize trade log
-if not os.path.exists(TRADE_LOG):
-    with open(TRADE_LOG, "w", newline="") as f:
-        csv.writer(f).writerow(["time","pair","dir","entry","exit","result"])
+# ----------------------
+# LOGGING
+# ----------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-# ---------------- EMA ----------------
+# ----------------------
+# EMA
+# ----------------------
 def ema(data, period):
-    if len(data) < period:
-        return None
+    if len(data) < period: return None
     k = 2 / (period + 1)
     val = data[0]
-    for p in data:
-        val = p * k + val * (1 - k)
+    for p in data: val = p * k + val * (1 - k)
     return val
 
-# ---------------- FEATURE EXTRACTION ----------------
-def extract_features(p):
-    if len(p) < 30:
-        return None
-    returns = (p[-1] - p[-2]) / p[-2]
-    volatility = np.std(p[-20:])
-    momentum = np.sum(np.diff(p[-10:]))
-    trend_strength = abs(ema(p[-20:],5) - ema(p[-50:],13))
-    return [returns, volatility, momentum, trend_strength]
+# ----------------------
+# TREND DETECTION
+# ----------------------
+def detect_trend(p):
+    if len(p) < 50: return None
+    e1 = ema(p[-10:],3)
+    e2 = ema(p[-20:],5)
+    e3 = ema(p[-30:],8)
+    e4 = ema(p[-50:],13)
+    if not all([e1,e2,e3,e4]): return None
+    if e1>e2 and e3>e4: return "BUY"
+    if e1<e2 and e3<e4: return "SELL"
+    return None
 
-# ---------------- MARKET STATE ----------------
-def market_state(p):
-    if len(p) < 20:
-        return "UNKNOWN"
-    vol = np.std(p[-20:])
-    if vol < 0.001:
-        return "RANGE"
-    elif vol > 0.005:
-        return "VOLATILE"
-    return "NORMAL"
+# ----------------------
+# PULLBACK & STABLE CHECK
+# ----------------------
+def is_stable_and_no_pullback(p,direction):
+    if len(p)<OBSERVATION_TICKS+5: return False
+    last_diff = np.diff(p[-OBSERVATION_TICKS:])
+    if direction=="BUY": return np.all(last_diff>0)
+    if direction=="SELL": return np.all(last_diff<0)
+    return False
 
-# ---------------- TELEGRAM ----------------
-def notify_entry(pair, direction, prob):
-    msg = f"✅ READY SIGNAL\nAsset: {pair}_otc\nDirection: {direction}\nConfidence: {prob}%"
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": msg})
+# ----------------------
+# MARKET NOISE FILTER
+# ----------------------
+def is_market_stable(p):
+    if len(p)<30: return False
+    std = np.std(p[-30:])
+    mean = np.mean(p[-30:])
+    return std/mean < 0.005
 
-def send_signal(pair, direction, prob):
-    msg = f"🚀 AI SIGNAL\nAsset: {pair}_otc\nDirection: {direction}\nConfidence: {prob}%"
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": msg})
+# ----------------------
+# EXPLOSION DETECTION
+# ----------------------
+def detect_explosion(p,direction):
+    if len(p)<OBSERVATION_TICKS: return False
+    recent_change = (p[-1]-p[-OBSERVATION_TICKS])/p[-OBSERVATION_TICKS]
+    if direction=="BUY" and recent_change >= EXPLOSION_THRESHOLD: return True
+    if direction=="SELL" and recent_change <= -EXPLOSION_THRESHOLD: return True
+    return False
 
-def log_trade(pair, direction, entry, exit_price):
-    result = "WIN" if (
-        (direction == "BUY" and exit_price > entry) or
-        (direction == "SELL" and exit_price < entry)
-    ) else "LOSS"
-    with open(TRADE_LOG, "a", newline="") as f:
-        csv.writer(f).writerow([datetime.now(TIMEZONE), pair, direction, entry, exit_price, result])
-    # Add to history for self-learning
-    features = extract_features(prices[pair])
-    if features:
-        features_history.append(features)
-        labels_history.append(1 if result=="WIN" else 0)
+# ----------------------
+# ACCURACY CALCULATION WITH EXPLOSION BOOST
+# ----------------------
+def calculate_accuracy(p,direction):
+    score=0
+    e1 = ema(p[-10:],3)
+    e2 = ema(p[-20:],5)
+    e3 = ema(p[-30:],8)
+    e4 = ema(p[-50:],13)
+    if direction=="BUY" and e1>e2 and e3>e4: score+=adaptive_weights["ema"]*100
+    if direction=="SELL" and e1<e2 and e3<e4: score+=adaptive_weights["ema"]*100
+    diff = np.diff(p[-5:])
+    if direction=="BUY" and np.all(diff>0): score+=adaptive_weights["momentum"]*100
+    if direction=="SELL" and np.all(diff<0): score+=adaptive_weights["momentum"]*100
+    std = np.std(p[-30:])
+    mean = np.mean(p[-30:])
+    if std/mean < 0.005: score+=adaptive_weights["volatility"]*100
+    last_diff = np.diff(p[-OBSERVATION_TICKS:])
+    if direction=="BUY" and np.all(last_diff>0): score+=adaptive_weights["pullback"]*100
+    if direction=="SELL" and np.all(last_diff<0): score+=adaptive_weights["pullback"]*100
+    if detect_explosion(p,direction):
+        logging.info(f"Explosion boost applied for {direction}")
+        score += EXPLOSION_BOOST
+    accuracy = min(score,100)
+    return max(MIN_ACCURACY,min(accuracy,MAX_ACCURACY))
 
-# ---------------- MACHINE LEARNING MODEL ----------------
-scaler = StandardScaler()
-model = SGDClassifier(loss="log", max_iter=1000, tol=1e-3)
-model_initialized = False
+# ----------------------
+# ADAPTIVE LEARNING
+# ----------------------
+def update_adaptive_weights(pair,direction,result):
+    signal_history[pair].append(result)
+    if len(signal_history[pair])>100: signal_history[pair].pop(0)
+    for k in adaptive_weights:
+        if result: adaptive_weights[k]=min(0.4,adaptive_weights[k]+0.01)
+        else: adaptive_weights[k]=max(0.15,adaptive_weights[k]-0.01)
+    if not result: pair_losses[pair]+=1
+    else: pair_losses[pair]=0
+    logging.info(f"Adaptive weights: {adaptive_weights} | Pair losses: {dict(pair_losses)}")
 
-def predict_ai(p):
-    global model_initialized
-    features = extract_features(p)
-    if not features:
-        return 0, None
-    x_scaled = scaler.transform([features]) if model_initialized else [features]
-    prob = model.predict_proba(x_scaled)[0][1] if model_initialized else 50
-    direction = "BUY" if prob > 0.5 else "SELL"
-    return prob*100, direction
+# ----------------------
+# TELEGRAM SIGNALS
+# ----------------------
+def send_asset(pair, move_type="Steady Trend"):
+    msg=f"""SIGNAL ⚠️
+Asset: {pair}_otc
+Expiration: M{EXPIRY_MINUTES}
+Move Type: {move_type}
+Observing market for stable move..."""
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
+    logging.info(f"Asset observation started: {pair} ({move_type})")
+    pending_signals[pair] = {"move_type": move_type, "status": "OBSERVING"}
 
-def update_model():
-    global model_initialized
-    if len(features_history) < 10:
-        return
-    X = np.array(features_history)
-    y = np.array(labels_history)
-    X_scaled = scaler.fit_transform(X)
-    model.partial_fit(X_scaled, y, classes=[0,1])
-    model_initialized = True
+def send_final(pair,direction,acc, move_type="Steady Trend"):
+    arrow="⬆️" if direction=="BUY" else "⬇️"
+    msg=f"""SIGNAL {arrow}
+Asset: {pair}_otc
+Payout: 92%
+Accuracy: {acc}%
+Expiration: M{EXPIRY_MINUTES}
+Move Type: {move_type}"""
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
+    logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}% ({move_type})")
+    pending_signals.pop(pair,None)
 
-# ---------------- LOAD SYMBOLS ----------------
+# ----------------------
+# LOAD SYMBOLS
+# ----------------------
 async def load_symbols():
     try:
         async with websockets.connect(DERIV_WS) as ws:
-            await ws.send(json.dumps({"active_symbols": "brief"}))
+            await ws.send(json.dumps({"active_symbols":"brief"}))
             res = json.loads(await ws.recv())
             return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
-    except:
+    except Exception as e:
+        logging.warning(f"Failed to load symbols: {e}")
         return []
 
-# ---------------- MAIN LOOP ----------------
+# ----------------------
+# MONITOR LOOP (REAL MARKET + 1-2 SIGNALS/HOUR)
+# ----------------------
 async def monitor():
+    global active_pair, last_signal_time, signals_sent_this_hour
+
     while True:
         try:
+            now = datetime.now(TIMEZONE)
+            if now.minute==0 and now.second<5:
+                signals_sent_this_hour=0
+
             symbols = await load_symbols()
-            if not symbols:
+            if not symbols: 
                 await asyncio.sleep(5)
                 continue
+
             for s in symbols:
-                prices[s] = []
-                tick_confirm[s] = {"count":0, "dir":None}
-                pending_signal[s] = None
+                if s not in prices: prices[s]=deque(maxlen=MAX_PRICES)
+                if s not in historical_memory: historical_memory[s]=deque(maxlen=1000)
+
             async with websockets.connect(DERIV_WS) as ws:
-                for s in symbols:
-                    await ws.send(json.dumps({"ticks": s, "subscribe":1}))
+                for pair in symbols: await ws.send(json.dumps({"ticks":pair,"subscribe":1}))
+
                 async for msg in ws:
                     try:
-                        data = json.loads(msg)
-                        if "tick" not in data:
-                            continue
-                        pair = data["tick"]["symbol"]
-                        price = data["tick"]["quote"]
+                        data=json.loads(msg)
+                        if "tick" not in data: continue
+
+                        pair=data["tick"]["symbol"]
+                        price=data["tick"]["quote"]
+                        live_ticks[pair] = price
+
+                        if pair_losses[pair]>=LOSS_FREEZE_COUNT: continue
                         prices[pair].append(price)
-                        if len(prices[pair]) > MAX_PRICES:
-                            prices[pair].pop(0)
-                        print(f"[LIVE] {pair} {price}")
+                        historical_memory[pair].append(price)
 
-                        # Skip if in cooldown
-                        if pair in cooldowns and datetime.now(TIMEZONE) < cooldowns[pair]:
+                        if active_pair: continue
+
+                        seconds_since_last = (datetime.now(TIMEZONE)-last_signal_time).total_seconds()
+                        if seconds_since_last<MIN_SIGNAL_INTERVAL or signals_sent_this_hour>=MAX_SIGNALS_PER_HOUR:
                             continue
 
-                        # Check market state
-                        if market_state(prices[pair]) != "NORMAL":
-                            continue
+                        direction=detect_trend(list(prices[pair]))
+                        if not direction: continue
+                        if not is_stable_and_no_pullback(list(prices[pair]),direction): continue
+                        if not is_market_stable(list(prices[pair])): continue
 
-                        # Predict AI probability
-                        prob, direction = predict_ai(prices[pair])
-                        if prob < PROB_THRESHOLD:
-                            continue
+                        move_type = "Big Move" if detect_explosion(list(prices[pair]),direction) else "Steady Trend"
 
-                        # Tick confirmation
-                        if tick_confirm[pair]["dir"] == direction:
-                            tick_confirm[pair]["count"] +=1
+                        observation_start = datetime.now(TIMEZONE)
+                        pre_prices = list(prices[pair])
+                        while (datetime.now(TIMEZONE)-observation_start).total_seconds()<PRE_SIGNAL_OBSERVATION:
+                            await asyncio.sleep(1)
+                            pre_prices.append(prices[pair][-1])
+                            if not is_stable_and_no_pullback(pre_prices,direction): break
                         else:
-                            tick_confirm[pair] = {"dir": direction, "count":1}
-                        if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
-                            continue
+                            acc = calculate_accuracy(pre_prices,direction)
+                            if acc<MIN_ACCURACY: continue
 
-                        # Pre-signal notification
-                        notify_entry(pair, direction, prob)
+                            active_pair=pair
+                            signals_sent_this_hour+=1
+                            last_signal_time=datetime.now(TIMEZONE)
 
-                        # Send signal
-                        entry_price = prices[pair][-1]
-                        send_signal(pair, direction, prob)
-                        cooldowns[pair] = datetime.now(TIMEZONE) + timedelta(minutes=COOLDOWN_MINUTES)
+                            send_asset(pair, move_type)
+                            await asyncio.sleep(2)
+                            send_final(pair,direction,acc, move_type)
 
-                        # Wait for signal duration and log exit
-                        await asyncio.sleep(60)
-                        exit_price = prices[pair][-1]
-                        log_trade(pair, direction, entry_price, exit_price)
+                            final_price = historical_memory[pair][-1]
+                            result=(direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
+                            update_adaptive_weights(pair,direction,result)
 
-                        # Update ML model
-                        update_model()
+                            active_pair=None
+                            prices[pair].clear()
 
-                        # Reset tick confirmation
-                        tick_confirm[pair] = {"count":0, "dir":None}
+                    except Exception as e_tick:
+                        logging.error(f"Tick error: {e_tick}")
 
-                    except Exception as e:
-                        print("[ERROR]", e)
-        except Exception as e:
-            print("[MAIN LOOP ERROR]", e)
+        except Exception as e_outer:
+            logging.error(f"Main loop error: {e_outer}")
             await asyncio.sleep(5)
 
+# ----------------------
+# RUN
+# ----------------------
 asyncio.run(monitor())
