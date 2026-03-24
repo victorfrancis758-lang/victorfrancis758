@@ -18,14 +18,13 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 OBSERVATION_TICKS = 15
-PRE_SIGNAL_OBSERVATION = 120
+PRE_SIGNAL_OBSERVATION = 120  # seconds
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 LOSS_FREEZE_COUNT = 2
 MIN_ACCURACY = 82
 MAX_ACCURACY = 95
-MIN_SIGNALS_PER_HOUR = 1
-MAX_SIGNALS_PER_HOUR = 2
 MIN_SIGNAL_INTERVAL = 1800  # 30 minutes
+MAX_SIGNALS_PER_HOUR = 2
 EXPLOSION_THRESHOLD = 0.01
 EXPLOSION_BOOST = 5
 
@@ -40,8 +39,6 @@ adaptive_weights = {"ema":0.25,"momentum":0.25,"volatility":0.25,"pullback":0.25
 active_pair = None
 last_signal_time = datetime.min.replace(tzinfo=TIMEZONE)
 signals_sent_this_hour = 0
-pending_signals = {}  # For deploy page visibility
-live_ticks = {}       # For live tick updates
 
 # ----------------------
 # LOGGING
@@ -49,7 +46,7 @@ live_ticks = {}       # For live tick updates
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # ----------------------
-# EMA
+# EMA UTILITY
 # ----------------------
 def ema(data, period):
     if len(data) < period: return None
@@ -83,7 +80,7 @@ def is_stable_and_no_pullback(p,direction):
     return False
 
 # ----------------------
-# MARKET NOISE FILTER
+# MARKET STABILITY
 # ----------------------
 def is_market_stable(p):
     if len(p)<30: return False
@@ -102,7 +99,7 @@ def detect_explosion(p,direction):
     return False
 
 # ----------------------
-# ACCURACY CALCULATION WITH EXPLOSION BOOST
+# ACCURACY CALCULATION
 # ----------------------
 def calculate_accuracy(p,direction):
     score=0
@@ -145,25 +142,23 @@ def update_adaptive_weights(pair,direction,result):
 # ----------------------
 def send_asset(pair, move_type="Steady Trend"):
     msg=f"""SIGNAL ⚠️
-Asset: {pair}_otc
+Asset: {pair}
 Expiration: M{EXPIRY_MINUTES}
 Move Type: {move_type}
 Observing market for stable move..."""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
     logging.info(f"Asset observation started: {pair} ({move_type})")
-    pending_signals[pair] = {"move_type": move_type, "status": "OBSERVING"}
 
 def send_final(pair,direction,acc, move_type="Steady Trend"):
     arrow="⬆️" if direction=="BUY" else "⬇️"
     msg=f"""SIGNAL {arrow}
-Asset: {pair}_otc
+Asset: {pair}
 Payout: 92%
 Accuracy: {acc}%
 Expiration: M{EXPIRY_MINUTES}
 Move Type: {move_type}"""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
     logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}% ({move_type})")
-    pending_signals.pop(pair,None)
 
 # ----------------------
 # LOAD SYMBOLS
@@ -179,11 +174,10 @@ async def load_symbols():
         return []
 
 # ----------------------
-# MONITOR LOOP (REAL MARKET + 1-2 SIGNALS/HOUR)
+# MONITOR LOOP
 # ----------------------
 async def monitor():
     global active_pair, last_signal_time, signals_sent_this_hour
-
     while True:
         try:
             now = datetime.now(TIMEZONE)
@@ -191,7 +185,7 @@ async def monitor():
                 signals_sent_this_hour=0
 
             symbols = await load_symbols()
-            if not symbols: 
+            if not symbols or active_pair:
                 await asyncio.sleep(5)
                 continue
 
@@ -206,10 +200,8 @@ async def monitor():
                     try:
                         data=json.loads(msg)
                         if "tick" not in data: continue
-
                         pair=data["tick"]["symbol"]
                         price=data["tick"]["quote"]
-                        live_ticks[pair] = price
 
                         if pair_losses[pair]>=LOSS_FREEZE_COUNT: continue
                         prices[pair].append(price)
@@ -217,9 +209,8 @@ async def monitor():
 
                         if active_pair: continue
 
-                        seconds_since_last = (datetime.now(TIMEZONE)-last_signal_time).total_seconds()
-                        if seconds_since_last<MIN_SIGNAL_INTERVAL or signals_sent_this_hour>=MAX_SIGNALS_PER_HOUR:
-                            continue
+                        seconds_since_last = (now-last_signal_time).total_seconds()
+                        if seconds_since_last<MIN_SIGNAL_INTERVAL or signals_sent_this_hour>=MAX_SIGNALS_PER_HOUR: continue
 
                         direction=detect_trend(list(prices[pair]))
                         if not direction: continue
@@ -245,6 +236,8 @@ async def monitor():
                             send_asset(pair, move_type)
                             await asyncio.sleep(2)
                             send_final(pair,direction,acc, move_type)
+
+                            await asyncio.sleep(EXPIRY_MINUTES*60)
 
                             final_price = historical_memory[pair][-1]
                             result=(direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
