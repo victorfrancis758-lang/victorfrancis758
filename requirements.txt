@@ -1,20 +1,15 @@
 # Telegram bot
 python-telegram-bot==20.5
 
-# Image handling
-Pillow==10.1.0
-
-# Numerical processing
-numpy==1.26.1
-
-# WebSocket support
+# WebSocket connection
 websockets==11.0.3
 
-# OpenCV compatible with Python 3.10
-opencv-python==4.8.0.76
+# Image handling
+Pillow==10.1.0
+numpy==1.26.1
 
-# Timezone handling
+# Timezones
 pytz==2023.3
 
-# Optional: requests for HTTP if your script needs it
-requests==2.32.0
+# Asyncio helper
+nest_asyncio==1.5.6
