@@ -1,5 +1,5 @@
 # ======================================
-# AI TRADER WITH CANDLESTICK + BoS + FVG + FEEDBACK
+# AI TRADER WITH CANDLESTICK + BoS + FVG + DEMAND/SUPPLY + FEEDBACK
 # ======================================
 
 import os
@@ -33,7 +33,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","direction","tp","sl","timeframe","result"
+            "time","direction","tp","sl","timeframe","demand_zone","supply_zone","result"
         ])
 
 # -------------------
@@ -91,13 +91,34 @@ def detect_candles_bos_fvg(image: Image):
     return direction, bos, fvg
 
 # -------------------
+# DEMAND & SUPPLY ZONE DETECTION
+# -------------------
+def detect_demand_supply(image: Image):
+    """
+    Simple detection based on local minima/maxima in grayscale intensity.
+    Returns approximate demand (support) and supply (resistance) levels.
+    """
+    img = np.array(image)
+    gray = np.mean(img, axis=2)
+    series = np.mean(gray, axis=0)
+
+    # Normalize series
+    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
+
+    # Identify demand (local minima) and supply (local maxima)
+    demand_zone = np.min(series)
+    supply_zone = np.max(series)
+
+    # Scale to price range (example 0-100)
+    demand_zone_price = round(demand_zone * 100, 2)
+    supply_zone_price = round(supply_zone * 100, 2)
+
+    return demand_zone_price, supply_zone_price
+
+# -------------------
 # TP/SL & TIMEFRAME CALCULATION (DYNAMIC TIMEFRAME)
 # -------------------
 def calculate_tp_sl(direction, bos, fvg, vol):
-    """
-    Calculates TP, SL, and automatically determines the best timeframe
-    to reach the TP and SL dynamically based on market volatility.
-    """
     base = 100
     risk = max(1, vol * 50 + (5 if fvg else 0))
 
@@ -108,7 +129,6 @@ def calculate_tp_sl(direction, bos, fvg, vol):
         sl = base + risk
         tp = base - risk * 2
 
-    # Dynamic timeframe calculation based on TP/SL distance and volatility
     distance = abs(tp - sl)
     if distance <= 5:
         timeframe = "M1"
@@ -126,10 +146,10 @@ def calculate_tp_sl(direction, bos, fvg, vol):
 # -------------------
 # SAVE TRADE
 # -------------------
-def save_trade(direction, tp, sl, timeframe):
+def save_trade(direction, tp, sl, timeframe, demand_zone, supply_zone):
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.now(TIMEZONE), direction, tp, sl, timeframe, "PENDING"
+            datetime.now(TIMEZONE), direction, tp, sl, timeframe, demand_zone, supply_zone, "PENDING"
         ])
 
 # -------------------
@@ -166,13 +186,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image = Image.open(bio)
 
     direction, bos, fvg = detect_candles_bos_fvg(image)
+    demand_zone, supply_zone = detect_demand_supply(image)
 
     if direction == "NO TRADE":
         await update.message.reply_text("No valid setup")
         return
 
     tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility)
-    save_trade(direction, tp, sl, timeframe)
+    save_trade(direction, tp, sl, timeframe, demand_zone, supply_zone)
 
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
@@ -186,6 +207,8 @@ Direction: {direction}
 TP: {tp}
 SL: {sl}
 Timeframe: {timeframe}
+Demand Zone: {demand_zone}
+Supply Zone: {supply_zone}
 """
     await update.message.reply_text(msg, reply_markup=reply_markup)
 
