@@ -1,4 +1,9 @@
+# Core
 python-telegram-bot==20.5
-Pillow==10.1.0
 numpy==1.26.1
+Pillow==10.1.0
+websockets==11.0.3
 opencv-python==4.8.1.78
+
+# Optional: If you need image handling extras
+opencv-contrib-python==4.8.1.78
