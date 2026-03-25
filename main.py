@@ -1,160 +1,208 @@
 # ======================================
-# TELEGRAM AI CHART ANALYZER (STABLE)
+# AI TRADER WITH FULL MERGED FEATURES
+# Candlestick + BoS + FVG + Live Ticks + Feedback
 # ======================================
 
 import os
 import csv
-import logging
+import json
+import asyncio
+import websockets
+import numpy as np
 from datetime import datetime
 from io import BytesIO
-
 import pytz
-import numpy as np
 from PIL import Image
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 
 # -------------------
 # CONFIG
 # -------------------
-BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
+BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"  # Replace with your Telegram bot token
+CHAT_ID = "8308393231"      # Replace with your Telegram chat ID
+DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
 DATA_DIR = "data"
-CSV_FILE = os.path.join(DATA_DIR, "logs.csv")
-
+LOG_FILE = os.path.join(DATA_DIR, "trades.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -------------------
 # INIT CSV
 # -------------------
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "time", "image", "direction", "tp", "sl", "timeframe"
-        ])
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, "w", newline="") as f:
+        csv.writer(f).writerow(["time","direction","tp","sl","timeframe","result"])
 
 # -------------------
-# CORE ANALYSIS ENGINE
+# GLOBAL MARKET MEMORY
 # -------------------
-def analyze_chart(image: Image.Image):
+market_volatility = 0.0
+confidence_bias = 0
 
+# -------------------
+# REAL MARKET (TICKS)
+# -------------------
+async def market_listener():
+    global market_volatility
+
+    async with websockets.connect(DERIV_WS) as ws:
+        # Subscribe to EURUSD; extend to other pairs if needed
+        await ws.send(json.dumps({"ticks":"frxEURUSD","subscribe":1}))
+
+        prices = []
+
+        async for msg in ws:
+            data = json.loads(msg)
+            if "tick" not in data: continue
+
+            price = data["tick"]["quote"]
+            prices.append(price)
+
+            if len(prices) > 100:
+                prices.pop(0)
+            if len(prices) >= 10:
+                market_volatility = np.std(prices)
+
+# -------------------
+# CANDLESTICK + BoS + FVG DETECTION
+# -------------------
+def detect_candles_bos_fvg(image: Image):
+    """
+    Simplified placeholder for candlestick + BoS + FVG detection.
+    Replace with a trained model for high-accuracy analysis.
+    """
     img = np.array(image)
-
-    # Convert to grayscale
     gray = np.mean(img, axis=2)
+    series = np.mean(gray, axis=0)
+    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
 
-    # Basic volatility estimation
-    volatility = np.std(gray)
+    trend = series[-1] - series[0]
+    diff = np.diff(series)
+    bos = np.any(np.abs(diff) > 0.08)
+    fvg = np.any(np.abs(diff) > 0.05) and bos
 
-    # Trend estimation (simple pixel gradient logic)
-    height, width = gray.shape
-    left = np.mean(gray[:, :width//2])
-    right = np.mean(gray[:, width//2:])
-
-    trend_strength = right - left
-
-    # -------------------
-    # DECISION LOGIC
-    # -------------------
-    if trend_strength > 2:
+    if trend > 0.05 and bos:
         direction = "BUY"
-    elif trend_strength < -2:
+    elif trend < -0.05 and bos:
         direction = "SELL"
     else:
-        direction = "RANGE"
+        direction = "NO TRADE"
 
-    # -------------------
-    # TP / SL LOGIC
-    # -------------------
-    base_price = 100  # symbolic since no price feed
+    return direction, bos, fvg
+
+# -------------------
+# TP/SL & TIMEFRAME CALCULATION
+# -------------------
+def calculate_tp_sl(direction, bos, fvg, vol):
+    base = 100
+    risk = max(1, vol * 50 + (5 if fvg else 0))
 
     if direction == "BUY":
-        sl = base_price - (volatility * 0.5)
-        tp = base_price + (volatility * 1.5)
-
-    elif direction == "SELL":
-        sl = base_price + (volatility * 0.5)
-        tp = base_price - (volatility * 1.5)
-
+        sl = base - risk
+        tp = base + risk * 2
     else:
-        sl = base_price
-        tp = base_price
+        sl = base + risk
+        tp = base - risk * 2
 
-    # -------------------
-    # TIMEFRAME ESTIMATION
-    # -------------------
-    if volatility < 20:
+    if vol < 0.03:
         timeframe = "M5"
-    elif volatility < 40:
+    elif vol < 0.06:
         timeframe = "M15"
     else:
         timeframe = "M30"
 
-    return direction, round(tp, 2), round(sl, 2), timeframe
+    return round(tp,2), round(sl,2), timeframe
 
 # -------------------
-# SAVE LOG
+# SAVE TRADE
 # -------------------
-def save_log(image_name, direction, tp, sl, timeframe):
-    with open(CSV_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now(TIMEZONE), image_name, direction, tp, sl, timeframe
-        ])
+def save_trade(direction, tp, sl, timeframe):
+    with open(LOG_FILE, "a", newline="") as f:
+        csv.writer(f).writerow([datetime.now(TIMEZONE), direction, tp, sl, timeframe, "PENDING"])
+
+# -------------------
+# UPDATE RESULT (WIN/LOSS FEEDBACK)
+# -------------------
+def update_last_result(result):
+    global confidence_bias
+    rows = []
+    with open(LOG_FILE, "r") as f:
+        rows = list(csv.reader(f))
+
+    rows[-1][-1] = result
+
+    with open(LOG_FILE, "w", newline="") as f:
+        csv.writer(f).writerows(rows)
+
+    # Learning effect
+    if result == "WIN":
+        confidence_bias += 1
+    else:
+        confidence_bias -= 1
 
 # -------------------
 # TELEGRAM HANDLERS
 # -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Send chart screenshot for analysis")
+    await update.message.reply_text("Send chart screenshot to analyze")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     photo = update.message.photo[-1]
     file = await photo.get_file()
-
     bio = BytesIO()
     await file.download_to_memory(bio)
     bio.seek(0)
-
     image = Image.open(bio)
 
-    # Analyze
-    direction, tp, sl, timeframe = analyze_chart(image)
+    direction, bos, fvg = detect_candles_bos_fvg(image)
+    if direction == "NO TRADE":
+        await update.message.reply_text("No valid setup detected")
+        return
 
-    # Save image
-    timestamp = datetime.now(TIMEZONE).strftime("%Y%m%d_%H%M%S")
-    filename = f"{DATA_DIR}/chart_{timestamp}.png"
-    image.save(filename)
+    tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility)
+    save_trade(direction, tp, sl, timeframe)
 
-    # Log
-    save_log(filename, direction, tp, sl, timeframe)
+    keyboard = [[InlineKeyboardButton("✅ WIN", callback_data="win"),
+                 InlineKeyboardButton("❌ LOSS", callback_data="loss")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Reply
     msg = f"""
-📊 ANALYSIS RESULT
-
+📊 SIGNAL
 Direction: {direction}
 TP: {tp}
 SL: {sl}
 Timeframe: {timeframe}
 """
+    await update.message.reply_text(msg, reply_markup=reply_markup)
 
-    await update.message.reply_text(msg)
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "win":
+        update_last_result("WIN")
+        await query.edit_message_text("Recorded: WIN ✅")
+    else:
+        update_last_result("LOSS")
+        await query.edit_message_text("Recorded: LOSS ❌")
 
 # -------------------
-# RUN BOT
+# MAIN
 # -------------------
-def main():
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(handle_button))
+
+    # Start market listener in background
+    asyncio.create_task(market_listener())
 
     print("Bot running...")
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
