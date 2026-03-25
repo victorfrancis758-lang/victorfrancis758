@@ -1,11 +1,7 @@
-# ======================================
-# AI Trader Stable Requirements
-# Compatible with Python 3.10
-# ======================================
-
 python-telegram-bot==20.3
 Pillow==9.5.0
 numpy==1.25.2
 websockets==11.0.3
-pytz==2026.1.post1
-requests==2.32.1
+pytz==2025.2
+nest_asyncio==1.5.6
+requests==2.32.0
