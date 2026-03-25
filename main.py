@@ -1,6 +1,5 @@
 # ======================================
-# AI TRADER WITH FULL MERGED FEATURES
-# Candlestick + BoS + FVG + Live Ticks + Feedback
+# AI TRADER WITH CANDLESTICK + BoS + FVG + FEEDBACK
 # ======================================
 
 import os
@@ -13,15 +12,14 @@ from datetime import datetime
 from io import BytesIO
 import pytz
 from PIL import Image
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 
 # -------------------
 # CONFIG
 # -------------------
-BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"  # Replace with your Telegram bot token
-CHAT_ID = "8308393231"      # Replace with your Telegram chat ID
+BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
+CHAT_ID = "8308393231"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
@@ -34,46 +32,45 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # -------------------
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
-        csv.writer(f).writerow(["time","direction","tp","sl","timeframe","result"])
+        csv.writer(f).writerow([
+            "time","direction","tp","sl","timeframe","result"
+        ])
 
 # -------------------
 # GLOBAL MARKET MEMORY
 # -------------------
 market_volatility = 0.0
-confidence_bias = 0
+confidence_bias = 0  # learning factor
 
 # -------------------
 # REAL MARKET (TICKS)
 # -------------------
 async def market_listener():
     global market_volatility
-
     async with websockets.connect(DERIV_WS) as ws:
-        # Subscribe to EURUSD; extend to other pairs if needed
+        # Subscribe to EURUSD, extendable
         await ws.send(json.dumps({"ticks":"frxEURUSD","subscribe":1}))
 
         prices = []
 
         async for msg in ws:
             data = json.loads(msg)
-            if "tick" not in data: continue
+            if "tick" not in data:
+                continue
 
             price = data["tick"]["quote"]
             prices.append(price)
 
             if len(prices) > 100:
                 prices.pop(0)
+
             if len(prices) >= 10:
                 market_volatility = np.std(prices)
 
 # -------------------
-# CANDLESTICK + BoS + FVG DETECTION
+# CANDLESTICK + BoS + FVG DETECTION (SIMPLIFIED)
 # -------------------
 def detect_candles_bos_fvg(image: Image):
-    """
-    Simplified placeholder for candlestick + BoS + FVG detection.
-    Replace with a trained model for high-accuracy analysis.
-    """
     img = np.array(image)
     gray = np.mean(img, axis=2)
     series = np.mean(gray, axis=0)
@@ -121,10 +118,12 @@ def calculate_tp_sl(direction, bos, fvg, vol):
 # -------------------
 def save_trade(direction, tp, sl, timeframe):
     with open(LOG_FILE, "a", newline="") as f:
-        csv.writer(f).writerow([datetime.now(TIMEZONE), direction, tp, sl, timeframe, "PENDING"])
+        csv.writer(f).writerow([
+            datetime.now(TIMEZONE), direction, tp, sl, timeframe, "PENDING"
+        ])
 
 # -------------------
-# UPDATE RESULT (WIN/LOSS FEEDBACK)
+# UPDATE RESULT
 # -------------------
 def update_last_result(result):
     global confidence_bias
@@ -137,7 +136,6 @@ def update_last_result(result):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerows(rows)
 
-    # Learning effect
     if result == "WIN":
         confidence_bias += 1
     else:
@@ -147,7 +145,7 @@ def update_last_result(result):
 # TELEGRAM HANDLERS
 # -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send chart screenshot to analyze")
+    await update.message.reply_text("Send chart screenshot")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
@@ -158,15 +156,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image = Image.open(bio)
 
     direction, bos, fvg = detect_candles_bos_fvg(image)
+
     if direction == "NO TRADE":
-        await update.message.reply_text("No valid setup detected")
+        await update.message.reply_text("No valid setup")
         return
 
     tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility)
     save_trade(direction, tp, sl, timeframe)
 
-    keyboard = [[InlineKeyboardButton("✅ WIN", callback_data="win"),
-                 InlineKeyboardButton("❌ LOSS", callback_data="loss")]]
+    keyboard = [
+        [InlineKeyboardButton("✅ WIN", callback_data="win"),
+         InlineKeyboardButton("❌ LOSS", callback_data="loss")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = f"""
@@ -198,11 +199,18 @@ async def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_button))
 
-    # Start market listener in background
+    # start market listener in background
     asyncio.create_task(market_listener())
 
     print("Bot running...")
     await app.run_polling()
 
+# -------------------
+# RAILWAY-FRIENDLY ENTRY POINT
+# -------------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    import nest_asyncio
+    nest_asyncio.apply()
+    loop = asyncio.get_event_loop()
+    loop.create_task(main())
+    loop.run_forever()
