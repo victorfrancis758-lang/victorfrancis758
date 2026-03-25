@@ -1,5 +1,7 @@
+python-telegram-bot==20.4
 numpy
-requests
-websockets
+opencv-python
 pytz
-river==0.22.0  # This version has prebuilt wheels
+pandas
+requests
+tensorflow  # or torch if you use PyTorch
