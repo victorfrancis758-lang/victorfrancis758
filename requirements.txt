@@ -1,7 +1,4 @@
 python-telegram-bot==20.5
 Pillow==10.1.0
 numpy==1.26.1
-opencv-python==4.9.0.74
-websockets==11.0.3
-nest_asyncio==1.5.6
-pytz==2026.3
+opencv-python==4.8.1.78
