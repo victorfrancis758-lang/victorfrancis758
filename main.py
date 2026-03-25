@@ -8,7 +8,7 @@ import json
 import asyncio
 import websockets
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 import pytz
 from PIL import Image
@@ -91,9 +91,13 @@ def detect_candles_bos_fvg(image: Image):
     return direction, bos, fvg
 
 # -------------------
-# TP/SL & TIMEFRAME CALCULATION
+# TP/SL & TIMEFRAME CALCULATION (DYNAMIC TIMEFRAME)
 # -------------------
 def calculate_tp_sl(direction, bos, fvg, vol):
+    """
+    Calculates TP, SL, and automatically determines the best timeframe
+    to reach the TP and SL dynamically based on market volatility.
+    """
     base = 100
     risk = max(1, vol * 50 + (5 if fvg else 0))
 
@@ -104,12 +108,18 @@ def calculate_tp_sl(direction, bos, fvg, vol):
         sl = base + risk
         tp = base - risk * 2
 
-    if vol < 0.03:
+    # Dynamic timeframe calculation based on TP/SL distance and volatility
+    distance = abs(tp - sl)
+    if distance <= 5:
+        timeframe = "M1"
+    elif distance <= 10:
         timeframe = "M5"
-    elif vol < 0.06:
+    elif distance <= 20:
         timeframe = "M15"
-    else:
+    elif distance <= 40:
         timeframe = "M30"
+    else:
+        timeframe = "H1"
 
     return round(tp,2), round(sl,2), timeframe
 
