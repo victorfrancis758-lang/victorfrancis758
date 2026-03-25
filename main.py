@@ -18,7 +18,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, Cal
 # -------------------
 # CONFIG
 # -------------------
-BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
+BOT_TOKEN = "8581515208:AAFWsel7xveab0iMmDE3NJ_5Ow3I4uaSvQo"
 CHAT_ID = "8308393231"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
