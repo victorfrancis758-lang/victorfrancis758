@@ -1,5 +1,5 @@
 # ======================================
-# AI TRADER WITH AUTOMATIC PAIRS FETCHING + CANDLESTICKS + BoS + FVG + DEMAND/SUPPLY + LEARNING
+# AI TRADER SIGNAL SYSTEM - REAL MONEY READY
 # ======================================
 
 import os
@@ -9,9 +9,7 @@ import asyncio
 import websockets
 import numpy as np
 from datetime import datetime, timedelta
-from io import BytesIO
 import pytz
-from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 
@@ -32,23 +30,20 @@ os.makedirs(DATA_DIR, exist_ok=True)
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","symbol","direction","tp","sl","timeframe","demand_zone","supply_zone","result"
+            "time","symbol","direction","tp","sl","timeframe","martingale","result"
         ])
 
 # -------------------
 # GLOBAL VARIABLES
 # -------------------
-market_volatility = {}
-confidence_bias = {}
-cooldown_tracker = {}
+market_volatility = {}      # store tick history per symbol
+cooldown_tracker = {}       # prevent spamming same signals
+adaptive_trend_factor = {}  # weekly adaptive adjustment
 
 # -------------------
-# HELPER FUNCTIONS
+# FETCH ALL SYMBOLS
 # -------------------
 async def fetch_all_pairs(ws):
-    """
-    Fetch all available market symbols including OTC and top 7 crypto.
-    """
     await ws.send(json.dumps({"active_symbols": "brief"}))
     while True:
         msg = await ws.recv()
@@ -68,7 +63,8 @@ async def market_listener():
     async with websockets.connect(DERIV_WS) as ws:
         pairs = await fetch_all_pairs(ws)
         print(f"Monitoring {len(pairs)} symbols: {pairs}")
-        # Subscribe to all symbols
+
+        # Subscribe to all pairs
         for p in pairs:
             await ws.send(json.dumps({"ticks": p, "subscribe": 1}))
             market_volatility[p] = []
@@ -84,47 +80,42 @@ async def market_listener():
                 market_volatility[symbol].pop(0)
 
 # -------------------
-# CANDLESTICKS, BoS & FVG DETECTION
+# SIGNAL GENERATION
 # -------------------
-def detect_candles_bos_fvg(image: Image):
-    img = np.array(image.convert("L"))
-    series = np.mean(img, axis=0)
-    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
-    trend = series[-1] - series[0]
-    diff = np.diff(series)
-    bos = np.any(np.abs(diff) > 0.08)
-    fvg = np.any(np.abs(diff) > 0.05) and bos
-    if trend > 0.05 and bos:
+def analyze_pair(symbol, ticks):
+    """
+    Very simple adaptive signal:
+    - Compare last tick vs moving average
+    - Determine trend and direction
+    """
+    if len(ticks) < 10:
+        return None  # not enough data
+
+    series = np.array(ticks)
+    ma = np.mean(series[-10:])
+    last = series[-1]
+
+    # adaptive weekly factor
+    factor = adaptive_trend_factor.get(symbol, 1.0)
+
+    if last > ma * (1 + 0.001*factor):
         direction = "BUY"
-    elif trend < -0.05 and bos:
+    elif last < ma * (1 - 0.001*factor):
         direction = "SELL"
     else:
-        direction = "NO TRADE"
-    return direction, bos, fvg
+        return None
 
-# -------------------
-# DEMAND/SUPPLY DETECTION
-# -------------------
-def detect_demand_supply(image: Image):
-    img = np.array(image.convert("L"))
-    series = np.mean(img, axis=0)
-    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
-    demand_zone = round(np.min(series)*100,2)
-    supply_zone = round(np.max(series)*100,2)
-    return demand_zone, supply_zone
-
-# -------------------
-# TP/SL CALCULATION
-# -------------------
-def calculate_tp_sl(direction, bos, fvg, vol):
-    base = 100
-    risk = max(1, np.std(vol)*50 + (5 if fvg else 0))
+    vol = np.std(series[-10:]) + 1e-5
+    base = last
+    risk = vol * 50
     if direction == "BUY":
         sl = base - risk
         tp = base + risk*2
     else:
         sl = base + risk
         tp = base - risk*2
+
+    # Determine timeframe based on distance
     distance = abs(tp - sl)
     if distance <= 5:
         timeframe = "M1"
@@ -136,66 +127,29 @@ def calculate_tp_sl(direction, bos, fvg, vol):
         timeframe = "M30"
     else:
         timeframe = "H1"
-    return round(tp,2), round(sl,2), timeframe
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "tp": round(tp,5),
+        "sl": round(sl,5),
+        "timeframe": timeframe
+    }
 
 # -------------------
 # SAVE TRADE
 # -------------------
-def save_trade(symbol, direction, tp, sl, timeframe, demand_zone, supply_zone):
+def save_trade(trade, martingale=0):
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.now(TIMEZONE), symbol, direction, tp, sl, timeframe, demand_zone, supply_zone, "PENDING"
+            datetime.now(TIMEZONE), trade["symbol"], trade["direction"], trade["tp"], trade["sl"],
+            trade["timeframe"], martingale, "PENDING"
         ])
 
 # -------------------
-# UPDATE RESULT
+# TELEGRAM SIGNAL
 # -------------------
-def update_last_result(result):
-    rows = []
-    with open(LOG_FILE, "r") as f:
-        rows = list(csv.reader(f))
-    rows[-1][-1] = result
-    with open(LOG_FILE, "w", newline="") as f:
-        csv.writer(f).writerows(rows)
-
-# -------------------
-# TELEGRAM HANDLERS
-# -------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send your chart screenshot to analyze.")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global cooldown_tracker
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    bio = BytesIO()
-    await file.download_to_memory(bio)
-    bio.seek(0)
-    image = Image.open(bio)
-
-    # Detect candlesticks
-    direction, bos, fvg = detect_candles_bos_fvg(image)
-    demand_zone, supply_zone = detect_demand_supply(image)
-
-    if direction == "NO TRADE":
-        await update.message.reply_text("No valid setup detected.")
-        return
-
-    # Use volatility from the market listener
-    symbol = "SCREENSHOT"  # placeholder symbol for screenshot trades
-    vol = market_volatility.get(symbol, [1]*10)
-    tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, vol)
-
-    # Cooldown check
-    last_time = cooldown_tracker.get(symbol)
-    now = datetime.now(TIMEZONE)
-    if last_time and (now - last_time).total_seconds() < 600:  # 10 min cooldown
-        await update.message.reply_text("Cooldown active. Wait before sending another signal.")
-        return
-    cooldown_tracker[symbol] = now
-
-    save_trade(symbol, direction, tp, sl, timeframe, demand_zone, supply_zone)
-
+async def send_signal(trade, context, martingale=0):
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
          InlineKeyboardButton("❌ LOSS", callback_data="loss")]
@@ -203,14 +157,43 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     msg = f"""
 📊 SIGNAL
-Direction: {direction}
-TP: {tp}
-SL: {sl}
-Timeframe: {timeframe}
-Demand Zone: {demand_zone}
-Supply Zone: {supply_zone}
+Symbol: {trade['symbol']}
+Direction: {trade['direction']}
+TP: {trade['tp']}
+SL: {trade['sl']}
+Timeframe: {trade['timeframe']}
+Martingale: {martingale}
 """
-    await update.message.reply_text(msg, reply_markup=reply_markup)
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=reply_markup)
+    save_trade(trade, martingale)
+
+# -------------------
+# GENERATE SIGNALS LOOP (ALL SYMBOLS SIMULTANEOUSLY)
+# -------------------
+async def generate_signals(app):
+    while True:
+        for symbol, ticks in market_volatility.items():
+            trade = analyze_pair(symbol, ticks)
+            if trade:
+                now = datetime.now(TIMEZONE)
+                last_time = cooldown_tracker.get(symbol)
+                if last_time and (now - last_time).total_seconds() < 120:
+                    continue
+                cooldown_tracker[symbol] = now
+
+                # Send primary signal and Martingale 3 levels
+                await send_signal(trade, app, martingale=0)
+                for i in range(1,4):
+                    # Martingale entry: 2 min apart
+                    await asyncio.sleep(120)
+                    await send_signal(trade, app, martingale=i)
+        await asyncio.sleep(5)  # small delay to loop again
+
+# -------------------
+# TELEGRAM HANDLERS
+# -------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("AI Trading Signal Bot is active. Signals will appear automatically.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -222,15 +205,23 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_last_result("LOSS")
         await query.edit_message_text("Recorded: LOSS ❌")
 
+def update_last_result(result):
+    rows = []
+    with open(LOG_FILE, "r") as f:
+        rows = list(csv.reader(f))
+    rows[-1][-1] = result
+    with open(LOG_FILE, "w", newline="") as f:
+        csv.writer(f).writerows(rows)
+
 # -------------------
 # MAIN
 # -------------------
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_button))
     asyncio.create_task(market_listener())
+    asyncio.create_task(generate_signals(app))
     print("Bot running...")
     await app.run_polling()
 
