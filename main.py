@@ -1,5 +1,5 @@
 # ======================================
-# AI TRADER WITH CANDLESTICK + BoS + FVG + DEMAND/SUPPLY + FEEDBACK
+# AI TRADER WITH SELF-LEARNING SYSTEM
 # ======================================
 
 import os
@@ -14,7 +14,6 @@ import pytz
 from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
-import nest_asyncio
 
 # -------------------
 # CONFIG
@@ -26,89 +25,114 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 
 DATA_DIR = "data"
 LOG_FILE = os.path.join(DATA_DIR, "trades.csv")
+STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -------------------
-# INIT CSV
+# INIT FILES
 # -------------------
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","direction","tp","sl","timeframe","demand_zone","supply_zone","result"
+            "time","direction","tp","sl","timeframe","result"
         ])
 
-# -------------------
-# GLOBAL MARKET MEMORY
-# -------------------
-market_volatility = 0.0
-confidence_bias = 0  # learning factor
+if not os.path.exists(STATS_FILE):
+    with open(STATS_FILE, "w") as f:
+        json.dump({
+            "buy_win":0,
+            "buy_loss":0,
+            "sell_win":0,
+            "sell_loss":0
+        }, f)
 
 # -------------------
-# REAL MARKET (TICKS)
+# GLOBAL
+# -------------------
+market_volatility = 0.0
+
+# -------------------
+# LOAD STATS
+# -------------------
+def load_stats():
+    with open(STATS_FILE) as f:
+        return json.load(f)
+
+def save_stats(stats):
+    with open(STATS_FILE, "w") as f:
+        json.dump(stats, f)
+
+# -------------------
+# REAL MARKET
 # -------------------
 async def market_listener():
     global market_volatility
     async with websockets.connect(DERIV_WS) as ws:
         await ws.send(json.dumps({"ticks":"frxEURUSD","subscribe":1}))
         prices = []
+
         async for msg in ws:
             data = json.loads(msg)
             if "tick" not in data:
                 continue
+
             price = data["tick"]["quote"]
             prices.append(price)
+
             if len(prices) > 100:
                 prices.pop(0)
+
             if len(prices) >= 10:
                 market_volatility = np.std(prices)
 
 # -------------------
-# CANDLESTICK + BoS + FVG DETECTION
+# SIMPLE IMAGE ANALYSIS
 # -------------------
-def detect_candles_bos_fvg(image: Image):
+def detect_direction(image: Image):
     img = np.array(image)
     gray = np.mean(img, axis=2)
-    series = np.mean(gray, axis=0)
-    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
-    trend = series[-1] - series[0]
-    diff = np.diff(series)
-    bos = np.any(np.abs(diff) > 0.08)
-    fvg = np.any(np.abs(diff) > 0.05) and bos
-    if trend > 0.05 and bos:
-        direction = "BUY"
-    elif trend < -0.05 and bos:
-        direction = "SELL"
+    trend = np.mean(gray[:, -50:]) - np.mean(gray[:, :50])
+
+    if trend > 0:
+        return "BUY"
     else:
-        direction = "NO TRADE"
-    return direction, bos, fvg
+        return "SELL"
 
 # -------------------
-# DEMAND & SUPPLY ZONE DETECTION
+# TP/SL WITH LEARNING
 # -------------------
-def detect_demand_supply(image: Image):
-    img = np.array(image)
-    gray = np.mean(img, axis=2)
-    series = np.mean(gray, axis=0)
-    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
-    demand_zone = np.min(series)
-    supply_zone = np.max(series)
-    demand_zone_price = round(demand_zone * 100, 2)
-    supply_zone_price = round(supply_zone * 100, 2)
-    return demand_zone_price, supply_zone_price
+def calculate_tp_sl(direction, vol):
+    stats = load_stats()
 
-# -------------------
-# TP/SL & TIMEFRAME CALCULATION
-# -------------------
-def calculate_tp_sl(direction, bos, fvg, vol):
     base = 100
-    risk = max(1, vol * 50 + (5 if fvg else 0))
+    risk = max(1, vol * 50)
+
+    # Learning adjustment
+    if direction == "BUY":
+        win = stats["buy_win"]
+        loss = stats["buy_loss"]
+    else:
+        win = stats["sell_win"]
+        loss = stats["sell_loss"]
+
+    total = win + loss if (win+loss) > 0 else 1
+    accuracy = win / total
+
+    # Adjust risk based on performance
+    if accuracy > 0.6:
+        risk *= 1.2
+    elif accuracy < 0.4:
+        risk *= 0.8
+
     if direction == "BUY":
         sl = base - risk
         tp = base + risk * 2
     else:
         sl = base + risk
         tp = base - risk * 2
+
     distance = abs(tp - sl)
+
     if distance <= 5:
         timeframe = "M1"
     elif distance <= 10:
@@ -119,40 +143,58 @@ def calculate_tp_sl(direction, bos, fvg, vol):
         timeframe = "M30"
     else:
         timeframe = "H1"
+
     return round(tp,2), round(sl,2), timeframe
 
 # -------------------
 # SAVE TRADE
 # -------------------
-def save_trade(direction, tp, sl, timeframe, demand_zone, supply_zone):
+def save_trade(direction, tp, sl, timeframe):
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.now(TIMEZONE), direction, tp, sl, timeframe, demand_zone, supply_zone, "PENDING"
+            datetime.now(TIMEZONE), direction, tp, sl, timeframe, "PENDING"
         ])
 
 # -------------------
-# UPDATE RESULT
+# UPDATE RESULT + LEARNING
 # -------------------
-def update_last_result(result):
-    global confidence_bias
+def update_last_result(direction, result):
+    stats = load_stats()
+
     rows = []
     with open(LOG_FILE, "r") as f:
         rows = list(csv.reader(f))
+
     rows[-1][-1] = result
+
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerows(rows)
-    if result == "WIN":
-        confidence_bias += 1
+
+    # Update learning stats
+    if direction == "BUY":
+        if result == "WIN":
+            stats["buy_win"] += 1
+        else:
+            stats["buy_loss"] += 1
     else:
-        confidence_bias -= 1
+        if result == "WIN":
+            stats["sell_win"] += 1
+        else:
+            stats["sell_loss"] += 1
+
+    save_stats(stats)
 
 # -------------------
-# TELEGRAM HANDLERS
+# TELEGRAM
 # -------------------
+last_signal_direction = None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send chart screenshot")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_signal_direction
+
     photo = update.message.photo[-1]
     file = await photo.get_file()
     bio = BytesIO()
@@ -160,22 +202,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bio.seek(0)
     image = Image.open(bio)
 
-    # Existing BoS/FVG and demand/supply detection
-    direction, bos, fvg = detect_candles_bos_fvg(image)
-    demand_zone, supply_zone = detect_demand_supply(image)
+    direction = detect_direction(image)
+    last_signal_direction = direction
 
-    if direction == "NO TRADE":
-        await update.message.reply_text("No valid setup")
-        return
-
-    tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility)
-    save_trade(direction, tp, sl, timeframe, demand_zone, supply_zone)
+    tp, sl, timeframe = calculate_tp_sl(direction, market_volatility)
+    save_trade(direction, tp, sl, timeframe)
 
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
          InlineKeyboardButton("❌ LOSS", callback_data="loss")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = f"""
 📊 SIGNAL
@@ -183,19 +219,21 @@ Direction: {direction}
 TP: {tp}
 SL: {sl}
 Timeframe: {timeframe}
-Demand Zone: {demand_zone}
-Supply Zone: {supply_zone}
 """
-    await update.message.reply_text(msg, reply_markup=reply_markup)
+
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_signal_direction
+
     query = update.callback_query
     await query.answer()
+
     if query.data == "win":
-        update_last_result("WIN")
+        update_last_result(last_signal_direction, "WIN")
         await query.edit_message_text("Recorded: WIN ✅")
     else:
-        update_last_result("LOSS")
+        update_last_result(last_signal_direction, "LOSS")
         await query.edit_message_text("Recorded: LOSS ❌")
 
 # -------------------
@@ -203,17 +241,21 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_button))
+
     asyncio.create_task(market_listener())
+
     print("Bot running...")
     await app.run_polling()
 
 # -------------------
-# ENTRY POINT
+# ENTRY
 # -------------------
 if __name__ == "__main__":
+    import nest_asyncio
     nest_asyncio.apply()
     loop = asyncio.get_event_loop()
     loop.create_task(main())
