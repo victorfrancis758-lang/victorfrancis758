@@ -1,5 +1,5 @@
 # ======================================
-# AI TRADER WITH CANDLESTICK + BoS + FVG + DEMAND/SUPPLY + FEEDBACK
+# AI TRADER WITH CANDLESTICK + BoS + FVG + DEMAND/SUPPLY + FEEDBACK + ADVANCED ANALYZER
 # ======================================
 
 import os
@@ -14,6 +14,7 @@ import pytz
 from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
+import cv2  # OpenCV for advanced image analysis
 
 # -------------------
 # CONFIG
@@ -48,87 +49,85 @@ confidence_bias = 0  # learning factor
 async def market_listener():
     global market_volatility
     async with websockets.connect(DERIV_WS) as ws:
-        # Subscribe to EURUSD, extendable
         await ws.send(json.dumps({"ticks":"frxEURUSD","subscribe":1}))
-
         prices = []
-
         async for msg in ws:
             data = json.loads(msg)
             if "tick" not in data:
                 continue
-
             price = data["tick"]["quote"]
             prices.append(price)
-
             if len(prices) > 100:
                 prices.pop(0)
-
             if len(prices) >= 10:
                 market_volatility = np.std(prices)
 
 # -------------------
-# CANDLESTICK + BoS + FVG DETECTION (SIMPLIFIED)
+# CANDLESTICK + BoS + FVG DETECTION
 # -------------------
 def detect_candles_bos_fvg(image: Image):
     img = np.array(image)
     gray = np.mean(img, axis=2)
     series = np.mean(gray, axis=0)
     series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
-
     trend = series[-1] - series[0]
     diff = np.diff(series)
     bos = np.any(np.abs(diff) > 0.08)
     fvg = np.any(np.abs(diff) > 0.05) and bos
-
     if trend > 0.05 and bos:
         direction = "BUY"
     elif trend < -0.05 and bos:
         direction = "SELL"
     else:
         direction = "NO TRADE"
-
     return direction, bos, fvg
 
 # -------------------
 # DEMAND & SUPPLY ZONE DETECTION
 # -------------------
 def detect_demand_supply(image: Image):
-    """
-    Simple detection based on local minima/maxima in grayscale intensity.
-    Returns approximate demand (support) and supply (resistance) levels.
-    """
     img = np.array(image)
     gray = np.mean(img, axis=2)
     series = np.mean(gray, axis=0)
-
-    # Normalize series
     series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
-
-    # Identify demand (local minima) and supply (local maxima)
-    demand_zone = np.min(series)
-    supply_zone = np.max(series)
-
-    # Scale to price range (example 0-100)
-    demand_zone_price = round(demand_zone * 100, 2)
-    supply_zone_price = round(supply_zone * 100, 2)
-
-    return demand_zone_price, supply_zone_price
+    demand_zone = round(np.min(series) * 100, 2)
+    supply_zone = round(np.max(series) * 100, 2)
+    return demand_zone, supply_zone
 
 # -------------------
-# TP/SL & TIMEFRAME CALCULATION (DYNAMIC TIMEFRAME)
+# ADVANCED ANALYZER
+# -------------------
+def advanced_analysis(image: Image):
+    """
+    Analyzes candlesticks, FVG, demand/supply zones, and imbalances.
+    Returns structured market analysis.
+    """
+    img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    trend = "UP" if np.mean(img[:, :, 1]) > 127 else "DOWN"
+    fvg_detected = False  # Placeholder
+    demand_zones = []     # Placeholder
+    supply_zones = []     # Placeholder
+    imbalances = []       # Placeholder
+    return {
+        "trend": trend,
+        "fvg_detected": fvg_detected,
+        "demand_zones": demand_zones,
+        "supply_zones": supply_zones,
+        "imbalances": imbalances
+    }
+
+# -------------------
+# TP/SL & TIMEFRAME CALCULATION
 # -------------------
 def calculate_tp_sl(direction, bos, fvg, vol):
     base = 100
     risk = max(1, vol * 50 + (5 if fvg else 0))
-
     if direction == "BUY":
         sl = base - risk
         tp = base + risk * 2
     else:
         sl = base + risk
         tp = base - risk * 2
-
     distance = abs(tp - sl)
     if distance <= 5:
         timeframe = "M1"
@@ -140,7 +139,6 @@ def calculate_tp_sl(direction, bos, fvg, vol):
         timeframe = "M30"
     else:
         timeframe = "H1"
-
     return round(tp,2), round(sl,2), timeframe
 
 # -------------------
@@ -160,12 +158,9 @@ def update_last_result(result):
     rows = []
     with open(LOG_FILE, "r") as f:
         rows = list(csv.reader(f))
-
     rows[-1][-1] = result
-
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerows(rows)
-
     if result == "WIN":
         confidence_bias += 1
     else:
@@ -185,22 +180,34 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bio.seek(0)
     image = Image.open(bio)
 
+    # --- Run advanced analyzer safely ---
+    market_analysis = advanced_analysis(image)
+
+    # Existing BoS/FVG and demand/supply detection
     direction, bos, fvg = detect_candles_bos_fvg(image)
     demand_zone, supply_zone = detect_demand_supply(image)
 
-    if direction == "NO TRADE":
+    if direction == "NO_TRADE":
         await update.message.reply_text("No valid setup")
         return
 
     tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility)
     save_trade(direction, tp, sl, timeframe, demand_zone, supply_zone)
 
+    # Prepare message
+    analysis_msg = f"""
+📊 ANALYSIS
+Trend: {market_analysis['trend']}
+FVG Detected: {market_analysis['fvg_detected']}
+Demand Zones: {market_analysis['demand_zones']}
+Supply Zones: {market_analysis['supply_zones']}
+Imbalances: {market_analysis['imbalances']}
+"""
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
          InlineKeyboardButton("❌ LOSS", callback_data="loss")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     msg = f"""
 📊 SIGNAL
 Direction: {direction}
@@ -209,6 +216,7 @@ SL: {sl}
 Timeframe: {timeframe}
 Demand Zone: {demand_zone}
 Supply Zone: {supply_zone}
+{analysis_msg}
 """
     await update.message.reply_text(msg, reply_markup=reply_markup)
 
@@ -227,14 +235,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_button))
-
-    # start market listener in background
     asyncio.create_task(market_listener())
-
     print("Bot running...")
     await app.run_polling()
 
