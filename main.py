@@ -14,7 +14,7 @@ import pytz
 from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
-import cv2  # OpenCV for advanced image analysis
+import cv2  # OpenCV for image processing
 
 # -------------------
 # CONFIG
@@ -85,36 +85,69 @@ def detect_candles_bos_fvg(image: Image):
 # -------------------
 # DEMAND & SUPPLY ZONE DETECTION
 # -------------------
-def detect_demand_supply(image: Image):
-    img = np.array(image)
-    gray = np.mean(img, axis=2)
-    series = np.mean(gray, axis=0)
-    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
-    demand_zone = round(np.min(series) * 100, 2)
-    supply_zone = round(np.max(series) * 100, 2)
+def detect_demand_supply_zones(high, low):
+    """
+    Convert high/low into approximate demand and supply zones.
+    """
+    demand_zone = round(low * 100, 2)
+    supply_zone = round(high * 100, 2)
     return demand_zone, supply_zone
 
 # -------------------
-# ADVANCED ANALYZER
+# EXTRACT CANDLES FROM IMAGE
 # -------------------
-def advanced_analysis(image: Image):
-    """
-    Analyzes candlesticks, FVG, demand/supply zones, and imbalances.
-    Returns structured market analysis.
-    """
-    img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    trend = "UP" if np.mean(img[:, :, 1]) > 127 else "DOWN"
-    fvg_detected = False  # Placeholder
-    demand_zones = []     # Placeholder
-    supply_zones = []     # Placeholder
-    imbalances = []       # Placeholder
-    return {
-        "trend": trend,
-        "fvg_detected": fvg_detected,
-        "demand_zones": demand_zones,
-        "supply_zones": supply_zones,
-        "imbalances": imbalances
-    }
+def extract_candles_from_image(image: Image, num_candles=50):
+    img = np.array(image.convert("L"))  # grayscale
+    h, w = img.shape
+    candle_width = w // num_candles
+    candles = []
+    for i in range(num_candles):
+        x_start = i * candle_width
+        x_end = x_start + candle_width
+        candle_slice = img[:, x_start:x_end]
+        high = 1 - np.min(candle_slice)/255
+        low = 1 - np.max(candle_slice)/255
+        open_ = 1 - np.mean(candle_slice[:h//2])/255
+        close = 1 - np.mean(candle_slice[h//2:])/255
+        candles.append((open_, high, low, close))
+    return candles
+
+# -------------------
+# FVG & IMBALANCE DETECTION
+# -------------------
+def detect_fvg_imbalances(candles):
+    fvg_list = []
+    imbalance_list = []
+    for i in range(2, len(candles)):
+        c1, c2, c3 = candles[i-2], candles[i-1], candles[i]
+        if c2[1] < c1[0] or c2[0] > c1[1]:
+            fvg_list.append((min(c2[0], c2[1]), max(c2[0], c2[1])))
+        range_prev = c1[1] - c1[2]
+        range_curr = c2[1] - c2[2]
+        if range_curr > range_prev * 1.5:
+            imbalance_list.append((c2[2], c2[1]))
+    return fvg_list, imbalance_list
+
+# -------------------
+# DRAW ZONES ON IMAGE
+# -------------------
+def draw_zones_on_image(image: Image, fvg_list, demand_zone, supply_zone, imbalance_list):
+    img = np.array(image.convert("RGB"))
+    h, w, _ = img.shape
+    overlay = img.copy()
+    for fvg in fvg_list:
+        y1 = int(fvg[0] * h)
+        y2 = int(fvg[1] * h)
+        cv2.rectangle(overlay, (0, y1), (w, y2), (0, 0, 255), 2)
+    y_demand = int(demand_zone / 100 * h)
+    cv2.line(overlay, (0, y_demand), (w, y_demand), (0, 255, 0), 2)
+    y_supply = int(supply_zone / 100 * h)
+    cv2.line(overlay, (0, y_supply), (w, y_supply), (255, 0, 0), 2)
+    for imb in imbalance_list:
+        y1 = int(imb[0] * h)
+        y2 = int(imb[1] * h)
+        cv2.line(overlay, (0, y1), (w, y2), (255, 255, 0), 2)
+    return Image.fromarray(overlay)
 
 # -------------------
 # TP/SL & TIMEFRAME CALCULATION
@@ -180,42 +213,44 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bio.seek(0)
     image = Image.open(bio)
 
-    # --- Run advanced analyzer safely ---
-    market_analysis = advanced_analysis(image)
+    # Extract candles from screenshot
+    candles = extract_candles_from_image(image)
+    fvg_list, imbalance_list = detect_fvg_imbalances(candles)
 
-    # Existing BoS/FVG and demand/supply detection
+    highs = max(c[1] for c in candles)
+    lows = min(c[2] for c in candles)
+    demand_zone, supply_zone = detect_demand_supply_zones(highs, lows)
+
+    # Existing BoS/FVG detection
     direction, bos, fvg = detect_candles_bos_fvg(image)
-    demand_zone, supply_zone = detect_demand_supply(image)
-
-    if direction == "NO_TRADE":
+    if direction == "NO TRADE":
         await update.message.reply_text("No valid setup")
         return
 
     tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility)
     save_trade(direction, tp, sl, timeframe, demand_zone, supply_zone)
 
-    # Prepare message
+    annotated_image = draw_zones_on_image(image, fvg_list, demand_zone, supply_zone, imbalance_list)
+
     analysis_msg = f"""
 📊 ANALYSIS
-Trend: {market_analysis['trend']}
-FVG Detected: {market_analysis['fvg_detected']}
-Demand Zones: {market_analysis['demand_zones']}
-Supply Zones: {market_analysis['supply_zones']}
-Imbalances: {market_analysis['imbalances']}
+FVG Detected: {fvg_list}
+Imbalances: {imbalance_list}
+Demand Zone: {demand_zone}
+Supply Zone: {supply_zone}
 """
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
          InlineKeyboardButton("❌ LOSS", callback_data="loss")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     msg = f"""
 📊 SIGNAL
 Direction: {direction}
 TP: {tp}
 SL: {sl}
 Timeframe: {timeframe}
-Demand Zone: {demand_zone}
-Supply Zone: {supply_zone}
 {analysis_msg}
 """
     await update.message.reply_text(msg, reply_markup=reply_markup)
