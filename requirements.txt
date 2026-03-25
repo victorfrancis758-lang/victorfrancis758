@@ -1,7 +1,4 @@
-python-telegram-bot==20.4
+python-telegram-bot==20.7
+pillow
 numpy
-opencv-python
 pytz
-pandas
-requests
-tensorflow  # or torch if you use PyTorch
