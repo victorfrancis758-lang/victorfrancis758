@@ -1,199 +1,127 @@
-# ======================================
-# STRUCTURE-BASED TRADING BOT (REAL LOGIC)
-# ======================================
+======================================
 
-import os, csv, json, asyncio, websockets, numpy as np, pytz
-from datetime import datetime
-from io import BytesIO
-from PIL import Image
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
+AI TRADER - OTC + 7 CRYPTO PAIRS + LEARNING + COOL-DOWN + TELEGRAM SIGNALS
 
-# -------------------
-BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
-DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
-TIMEZONE = pytz.timezone("Africa/Lagos")
+======================================
 
-DATA_DIR = "data"
-LOG_FILE = os.path.join(DATA_DIR, "trades.csv")
-os.makedirs(DATA_DIR, exist_ok=True)
+import os import csv import json import asyncio import websockets import numpy as np from datetime import datetime, timedelta from io import BytesIO import pytz from PIL import Image from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters import cv2
 
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE,"w",newline="") as f:
-        csv.writer(f).writerow(["time","direction","entry","tp","sl","timeframe","result"])
+-------------------
 
-market_prices = []
+CONFIG
 
-# -------------------
-# MARKET FEED
-# -------------------
-async def market_listener():
-    global market_prices
-    async with websockets.connect(DERIV_WS) as ws:
-        await ws.send(json.dumps({"ticks":"frxEURUSD","subscribe":1}))
+-------------------
 
-        async for msg in ws:
-            data = json.loads(msg)
-            if "tick" not in data: continue
+BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak" CHAT_ID = "8308393231" DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089" TIMEZONE = pytz.timezone("Africa/Lagos") DATA_DIR = "data" LOG_FILE = os.path.join(DATA_DIR, "trades.csv") os.makedirs(DATA_DIR, exist_ok=True)
 
-            price = data["tick"]["quote"]
-            market_prices.append(price)
+Currency & crypto pairs
 
-            if len(market_prices) > 200:
-                market_prices.pop(0)
+OTC_PAIRS = [ "frxUSDJPY", "frxUSDCHF", "frxUSDSGD", "frxUSDMXN", "frxUSDTRY", "frxUSDZAR", "frxUSDHKD", "frxUSDSEK", "frxUSDCNH", "frxUSDPHP" ] CRYPTO_PAIRS = [ "frxBTCUSD", "frxETHUSD", "frxXRPUSD", "frxLTCUSD", "frxBCHUSD", "frxADAUSD", "frxDOGEUSD" ] ALL_PAIRS = OTC_PAIRS + CRYPTO_PAIRS
 
-# -------------------
-# STRUCTURE LOGIC
-# -------------------
-def analyze_market_structure():
-    if len(market_prices) < 50:
-        return None
+COOLDOWN_DEFAULT = 10  # minutes
 
-    prices = np.array(market_prices[-50:])
+-------------------
 
-    highs = []
-    lows = []
+INIT CSV
 
-    for i in range(2, len(prices)-2):
-        if prices[i] > prices[i-1] and prices[i] > prices[i+1]:
-            highs.append(prices[i])
-        if prices[i] < prices[i-1] and prices[i] < prices[i+1]:
-            lows.append(prices[i])
+-------------------
 
-    if len(highs) < 2 or len(lows) < 2:
-        return None
+if not os.path.exists(LOG_FILE): with open(LOG_FILE, "w", newline="") as f: csv.writer(f).writerow([ "time","pair","direction","tp","sl","timeframe","result" ])
 
-    # Trend detection
-    if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
-        trend = "UP"
-    elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
-        trend = "DOWN"
-    else:
-        trend = "RANGE"
+-------------------
 
-    # Break of Structure
-    bos = False
-    if trend == "UP" and prices[-1] > highs[-2]:
-        bos = True
-    elif trend == "DOWN" and prices[-1] < lows[-2]:
-        bos = True
+GLOBAL MARKET MEMORY
 
-    return trend, bos, highs, lows
+-------------------
 
-# -------------------
-# TRADE SETUP
-# -------------------
-def generate_trade():
-    data = analyze_market_structure()
-    if not data:
-        return None
+market_volatility = {pair:0.0 for pair in ALL_PAIRS} confidence_bias = {pair:0 for pair in ALL_PAIRS} cooldowns = {pair:datetime.min for pair in ALL_PAIRS}
 
-    trend, bos, highs, lows = data
-    current_price = market_prices[-1]
+-------------------
 
-    if trend == "UP" and bos:
-        entry = current_price
-        sl = lows[-1]
-        tp = entry + (entry - sl) * 2
-        direction = "BUY"
+MARKET LISTENER
 
-    elif trend == "DOWN" and bos:
-        entry = current_price
-        sl = highs[-1]
-        tp = entry - (sl - entry) * 2
-        direction = "SELL"
+-------------------
 
-    else:
-        return None
+async def market_listener(): async with websockets.connect(DERIV_WS) as ws: for pair in ALL_PAIRS: await ws.send(json.dumps({"ticks": pair, "subscribe":1})) prices = {pair:[] for pair in ALL_PAIRS} async for msg in ws: data = json.loads(msg) if "tick" not in data: continue pair = data["tick"]["symbol"] price = data["tick"]["quote"] prices[pair].append(price) if len(prices[pair]) > 100: prices[pair].pop(0) if len(prices[pair]) >= 10: market_volatility[pair] = np.std(prices[pair])
 
-    distance = abs(tp - sl)
+-------------------
 
-    if distance < 0.0005:
-        timeframe = "M1"
-    elif distance < 0.001:
-        timeframe = "M5"
-    elif distance < 0.002:
-        timeframe = "M15"
-    else:
-        timeframe = "M30"
+IMAGE ANALYSIS FUNCTIONS
 
-    return direction, entry, tp, sl, timeframe
+-------------------
 
-# -------------------
-# SAVE
-# -------------------
-def save_trade(direction, entry, tp, sl, timeframe):
-    with open(LOG_FILE,"a",newline="") as f:
-        csv.writer(f).writerow([
-            datetime.now(TIMEZONE), direction, entry, tp, sl, timeframe, "PENDING"
-        ])
+def detect_candles_bos_fvg(image: Image): img = np.array(image) gray = np.mean(img, axis=2) series = np.mean(gray, axis=0) series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9) trend = series[-1] - series[0] diff = np.diff(series) bos = np.any(np.abs(diff) > 0.08) fvg = np.any(np.abs(diff) > 0.05) and bos if trend > 0.05 and bos: direction = "BUY" elif trend < -0.05 and bos: direction = "SELL" else: direction = "NO TRADE" return direction, bos, fvg
 
-def update_last(result):
-    rows = list(csv.reader(open(LOG_FILE)))
-    rows[-1][-1] = result
-    with open(LOG_FILE,"w",newline="") as f:
-        csv.writer(f).writerows(rows)
+def detect_demand_supply(image: Image): img = np.array(image) gray = np.mean(img, axis=2) series = np.mean(gray, axis=0) series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9) demand_zone = np.min(series) supply_zone = np.max(series) demand_zone_price = round(demand_zone * 100, 2) supply_zone_price = round(supply_zone * 100, 2) return demand_zone_price, supply_zone_price
 
-# -------------------
-# TELEGRAM
-# -------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send screenshot to trigger analysis")
+-------------------
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trade = generate_trade()
+TP/SL & TIMEFRAME CALCULATION
 
-    if not trade:
-        await update.message.reply_text("❌ No valid structure setup")
-        return
+-------------------
 
-    direction, entry, tp, sl, timeframe = trade
-    save_trade(direction, entry, tp, sl, timeframe)
+def calculate_tp_sl(direction, bos, fvg, vol): base = 100 risk = max(1, vol * 50 + (5 if fvg else 0)) if direction == "BUY": sl = base - risk tp = base + risk * 2 else: sl = base + risk tp = base - risk * 2 distance = abs(tp - sl) if distance <= 5: timeframe = "M1" elif distance <= 10: timeframe = "M5" elif distance <= 20: timeframe = "M15" elif distance <= 40: timeframe = "M30" else: timeframe = "H1" return round(tp,2), round(sl,2), timeframe
 
-    msg = f"""
-📊 STRUCTURE SIGNAL
+-------------------
 
-Direction: {direction}
-Entry: {entry}
-TP: {round(tp,5)}
-SL: {round(sl,5)}
-Timeframe: {timeframe}
-"""
+SAVE & UPDATE TRADE
 
-    keyboard = [[
-        InlineKeyboardButton("✅ WIN", callback_data="win"),
-        InlineKeyboardButton("❌ LOSS", callback_data="loss")
-    ]]
+-------------------
 
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+def save_trade(pair, direction, tp, sl, timeframe): with open(LOG_FILE, "a", newline="") as f: csv.writer(f).writerow([ datetime.now(TIMEZONE), pair, direction, tp, sl, timeframe, "PENDING" ])
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+def update_last_result(pair, result): global confidence_bias rows = [] with open(LOG_FILE, "r") as f: rows = list(csv.reader(f)) for i in range(len(rows)-1, 0, -1): if rows[i][1] == pair and rows[i][-1] == "PENDING": rows[i][-1] = result break with open(LOG_FILE, "w", newline="") as f: csv.writer(f).writerows(rows) if result == "WIN": confidence_bias[pair] += 1 else: confidence_bias[pair] -= 1
 
-    if query.data == "win":
-        update_last("WIN")
-        await query.edit_message_text("Recorded WIN ✅")
-    else:
-        update_last("LOSS")
-        await query.edit_message_text("Recorded LOSS ❌")
+-------------------
 
-# -------------------
-# MAIN
-# -------------------
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+TELEGRAM HANDLERS
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(CallbackQueryHandler(handle_button))
+-------------------
 
-    asyncio.create_task(market_listener())
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("Send chart screenshot")
 
-    print("Running REAL trading bot...")
-    await app.run_polling()
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE): photo = update.message.photo[-1] file = await photo.get_file() bio = BytesIO() await file.download_to_memory(bio) bio.seek(0) image = Image.open(bio)
 
-if __name__ == "__main__":
-    import nest_asyncio, asyncio
-    nest_asyncio.apply()
-    asyncio.get_event_loop().run_until_complete(main())
+direction, bos, fvg = detect_candles_bos_fvg(image)
+demand_zone, supply_zone = detect_demand_supply(image)
+
+pair = "UNKNOWN"  # TODO: Could be detected from filename or message
+
+now = datetime.now(TIMEZONE)
+if now < cooldowns.get(pair, datetime.min):
+    await update.message.reply_text(f"Cooldown active. Wait until {cooldowns[pair]}")
+    return
+
+if direction == "NO TRADE":
+    await update.message.reply_text("No valid setup")
+    return
+
+tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility.get(pair,1))
+save_trade(pair, direction, tp, sl, timeframe)
+
+cooldowns[pair] = now + timedelta(minutes=COOLDOWN_DEFAULT)
+
+keyboard = [[InlineKeyboardButton("✅ WIN", callback_data=f"win|{pair}"),
+             InlineKeyboardButton("❌ LOSS", callback_data=f"loss|{pair}")]]
+reply_markup = InlineKeyboardMarkup(keyboard)
+
+msg = f"Direction: {direction}\nTP: {tp}\nSL: {sl}\nTimeframe: {timeframe}\nDemand Zone: {demand_zone}\nSupply Zone: {supply_zone}"
+await update.message.reply_text(msg, reply_markup=reply_markup)
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE): query = update.callback_query await query.answer() data = query.data.split('|') result, pair = data[0].upper(), data[1] update_last_result(pair, result) await query.edit_message_text(f"Recorded: {result} ✅" if result=="WIN" else f"Recorded: {result} ❌")
+
+-------------------
+
+MAIN
+
+-------------------
+
+async def main(): app = ApplicationBuilder().token(BOT_TOKEN).build() app.add_handler(CommandHandler("start", start)) app.add_handler(MessageHandler(filters.PHOTO, handle_photo)) app.add_handler(CallbackQueryHandler(handle_button)) asyncio.create_task(market_listener()) print("Bot running...") await app.run_polling()
+
+-------------------
+
+ENTRY POINT
+
+-------------------
+
+if name == "main": import nest_asyncio nest_asyncio.apply() loop = asyncio.get_event_loop() loop.create_task(main()) loop.run_forever()
