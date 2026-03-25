@@ -1,5 +1,5 @@
 # ======================================
-# AI TRADER WITH CANDLESTICK + BoS + FVG + DEMAND/SUPPLY + FEEDBACK + ADVANCED ANALYZER
+# AI TRADER WITH CANDLESTICK + BoS + FVG + DEMAND/SUPPLY + FEEDBACK
 # ======================================
 
 import os
@@ -14,9 +14,7 @@ import pytz
 from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
-
-# Import the fully working analyzer
-from chart_analyzer import analyzer
+import nest_asyncio
 
 # -------------------
 # CONFIG
@@ -85,6 +83,20 @@ def detect_candles_bos_fvg(image: Image):
     return direction, bos, fvg
 
 # -------------------
+# DEMAND & SUPPLY ZONE DETECTION
+# -------------------
+def detect_demand_supply(image: Image):
+    img = np.array(image)
+    gray = np.mean(img, axis=2)
+    series = np.mean(gray, axis=0)
+    series = (series - np.min(series)) / (np.max(series) - np.min(series) + 1e-9)
+    demand_zone = np.min(series)
+    supply_zone = np.max(series)
+    demand_zone_price = round(demand_zone * 100, 2)
+    supply_zone_price = round(supply_zone * 100, 2)
+    return demand_zone_price, supply_zone_price
+
+# -------------------
 # TP/SL & TIMEFRAME CALCULATION
 # -------------------
 def calculate_tp_sl(direction, bos, fvg, vol):
@@ -148,14 +160,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bio.seek(0)
     image = Image.open(bio)
 
-    # -------------------
-    # RUN FULL ANALYZER
-    # -------------------
-    market_analysis = analyzer.analyze(image)
-
+    # Existing BoS/FVG and demand/supply detection
     direction, bos, fvg = detect_candles_bos_fvg(image)
-    demand_zone = market_analysis['demand_zone']
-    supply_zone = market_analysis['supply_zone']
+    demand_zone, supply_zone = detect_demand_supply(image)
 
     if direction == "NO TRADE":
         await update.message.reply_text("No valid setup")
@@ -164,15 +171,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tp, sl, timeframe = calculate_tp_sl(direction, bos, fvg, market_volatility)
     save_trade(direction, tp, sl, timeframe, demand_zone, supply_zone)
 
-    analysis_msg = f"""
-📊 ANALYSIS
-Candles Detected: {market_analysis['candles']}
-FVG: {market_analysis['fvg']}
-BoS: {market_analysis['bos']}
-Imbalance: {market_analysis['imbalance']}
-Demand Zone: {market_analysis['demand_zone']}
-Supply Zone: {market_analysis['supply_zone']}
-"""
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
          InlineKeyboardButton("❌ LOSS", callback_data="loss")]
@@ -185,7 +183,8 @@ Direction: {direction}
 TP: {tp}
 SL: {sl}
 Timeframe: {timeframe}
-{analysis_msg}
+Demand Zone: {demand_zone}
+Supply Zone: {supply_zone}
 """
     await update.message.reply_text(msg, reply_markup=reply_markup)
 
@@ -212,10 +211,9 @@ async def main():
     await app.run_polling()
 
 # -------------------
-# RAILWAY-FRIENDLY ENTRY POINT
+# ENTRY POINT
 # -------------------
 if __name__ == "__main__":
-    import nest_asyncio
     nest_asyncio.apply()
     loop = asyncio.get_event_loop()
     loop.create_task(main())
