@@ -1,14 +1,5 @@
-# Core Telegram bot library
 python-telegram-bot==20.6
-
-# WebSocket client for market data
 websockets==11.0.3
-
-# Numpy for calculations
 numpy==1.26.4
-
-# Timezone handling
 pytz==2026.1
-
-# Optional: requests if you fetch online resources
-requests==2.31.0
+nest_asyncio==1.5.6
