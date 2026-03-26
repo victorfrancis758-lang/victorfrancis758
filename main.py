@@ -36,7 +36,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","symbol","direction","tp","sl","timeframe","martingale","result","screenshot_numbers"
+            "time","symbol","direction","tp","sl","timeframe","martingale","result"
         ])
 
 # -------------------
@@ -146,18 +146,17 @@ def analyze_pair(symbol, ticks):
 # -------------------
 # SAVE TRADE
 # -------------------
-def save_trade(trade, martingale=0, screenshot_numbers=None):
+def save_trade(trade, martingale=0):
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([
             datetime.now(TIMEZONE), trade["symbol"], trade["direction"], trade["tp"], trade["sl"],
-            trade["timeframe"], martingale, "PENDING",
-            ",".join([str(n) for n in screenshot_numbers]) if screenshot_numbers else ""
+            trade["timeframe"], martingale, "PENDING"
         ])
 
 # -------------------
 # TELEGRAM SIGNAL
 # -------------------
-async def send_signal(trade, context, martingale=0, screenshot_numbers=None):
+async def send_signal(trade, context, martingale=0):
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
          InlineKeyboardButton("❌ LOSS", callback_data="loss")]
@@ -173,7 +172,7 @@ Timeframe: {trade['timeframe']}
 Martingale: {martingale}
 """
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=reply_markup)
-    save_trade(trade, martingale, screenshot_numbers)
+    save_trade(trade, martingale)
 
 # -------------------
 # TELEGRAM HANDLERS
@@ -195,32 +194,25 @@ def update_last_result(result):
     rows = []
     with open(LOG_FILE, "r") as f:
         rows = list(csv.reader(f))
-    rows[-1][-2] = result
+    rows[-1][-1] = result
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerows(rows)
 
 # -------------------
-# OCR SCREENSHOT HANDLER (IMPROVED)
+# OCR SCREENSHOT HANDLER
 # -------------------
 async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
-        await update.message.reply_text("⚠️ Please send a proper screenshot of a chart.")
         return
-
-    # Get the highest resolution photo
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     file_bytes = await file.download_as_bytearray()
-
-    # Open image with PIL
     image = Image.open(io.BytesIO(file_bytes))
 
     # OCR extraction
     text = pytesseract.image_to_string(image)
     lines = text.splitlines()
     numbers = []
-
-    # Extract all float numbers from the OCR
     for line in lines:
         for token in line.split():
             try:
@@ -233,14 +225,11 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No valid numbers detected in the screenshot.")
         return
 
-    # Use the **average of last 3 numbers** for signal generation
-    last_prices = numbers[-3:] if len(numbers) >= 3 else numbers
-    avg_price = sum(last_prices) / len(last_prices)
-
-    # Generate a trade signal using your existing analyze_pair logic
-    trade = analyze_pair("SCREENSHOT:UNKNOWN", [avg_price])
+    # Use last number as last tick
+    last_price = numbers[-1]
+    trade = analyze_pair("SCREENSHOT:UNKNOWN", [last_price])
     if trade:
-        await send_signal(trade, context, screenshot_numbers=numbers)
+        await send_signal(trade, context)
     else:
         await update.message.reply_text("⚠️ Unable to generate signal from the screenshot.")
 
