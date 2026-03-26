@@ -1,19 +1,31 @@
 #!/bin/bash
-# Railway build script for AI Trading Bot with Tesseract OCR
+# ======================================
+# RAILWAY BUILD SCRIPT
+# ======================================
+# This script installs dependencies and ensures the environment is ready
+# for deploying the AI Trading Signal Bot on Railway.
 
-# Update system packages
-sudo apt-get update
-sudo apt-get install -y tesseract-ocr
-
-# Activate virtual environment
-python -m venv /app/.venv
-source /app/.venv/bin/activate
+echo "Starting Railway Build Script..."
 
 # Upgrade pip
-pip install --upgrade pip
+python -m pip install --upgrade pip
 
-# Install Python dependencies
-pip install -r requirements.txt
+# Install required Python packages from requirements.txt
+if [ -f "requirements.txt" ]; then
+    echo "Installing Python dependencies..."
+    pip install --no-cache-dir -r requirements.txt
+else
+    echo "Error: requirements.txt not found!"
+    exit 1
+fi
 
-# Run the bot
-python main.py
+# Verify that the Telegram bot and websockets packages are installed
+echo "Verifying installations..."
+python -c "import telegram; print('python-telegram-bot installed')"
+python -c "import websockets; print('websockets installed')"
+python -c "import numpy; print('numpy installed')"
+python -c "import PIL; print('Pillow installed')"
+python -c "import pytz; print('pytz installed')"
+python -c "import pytesseract; print('pytesseract installed')"
+
+echo "Railway Build Script finished successfully!"
