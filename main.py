@@ -1,5 +1,6 @@
 # ======================================
 # AI TRADER SIGNAL SYSTEM - REAL MONEY READY
+# Supports Screenshots on Telegram
 # ======================================
 
 import os
@@ -13,8 +14,7 @@ import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 
-# For screenshot OCR
-from PIL import Image
+from PIL import Image, ImageEnhance
 import io
 import pytesseract
 import requests
@@ -70,7 +70,6 @@ async def market_listener():
         pairs = await fetch_all_pairs(ws)
         print(f"Monitoring {len(pairs)} symbols: {pairs}")
 
-        # Subscribe to all pairs
         for p in pairs:
             await ws.send(json.dumps({"ticks": p, "subscribe": 1}))
             market_volatility[p] = []
@@ -86,7 +85,7 @@ async def market_listener():
                 market_volatility[symbol].pop(0)
 
 # -------------------
-# SIGNAL GENERATION (TP/SL FIXED)
+# SIGNAL GENERATION
 # -------------------
 def analyze_pair(symbol, ticks):
     if len(ticks) < 1:
@@ -95,7 +94,6 @@ def analyze_pair(symbol, ticks):
     series = np.array(ticks[-10:]) if len(ticks) >= 10 else np.array(ticks)
     ma = np.mean(series)
     last = series[-1]
-
     factor = adaptive_trend_factor.get(symbol, 1.0)
 
     if last > ma * (1 + 0.001*factor):
@@ -202,14 +200,30 @@ def update_last_result(result):
 # OCR SCREENSHOT HANDLER
 # -------------------
 async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        return
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    file_bytes = await file.download_as_bytearray()
-    image = Image.open(io.BytesIO(file_bytes))
+    file_bytes = None
 
-    # OCR extraction
+    # Accept photos or document images
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        file_bytes = await file.download_as_bytearray()
+    elif update.message.document:
+        doc = update.message.document
+        if doc.mime_type.startswith("image"):
+            file = await context.bot.get_file(doc.file_id)
+            file_bytes = await file.download_as_bytearray()
+    
+    if not file_bytes:
+        await update.message.reply_text("⚠️ Please send a photo or image file.")
+        return
+
+    await update.message.reply_text("🖼️ Processing screenshot...")
+
+    image = Image.open(io.BytesIO(file_bytes))
+    image = image.convert("L")  # grayscale
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2)
+
     text = pytesseract.image_to_string(image)
     lines = text.splitlines()
     numbers = []
@@ -224,8 +238,8 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not numbers:
         await update.message.reply_text("⚠️ No valid numbers detected in the screenshot.")
         return
+    await update.message.reply_text(f"Numbers detected: {numbers}")
 
-    # Use last number as last tick
     last_price = numbers[-1]
     trade = analyze_pair("SCREENSHOT:UNKNOWN", [last_price])
     if trade:
@@ -256,7 +270,8 @@ async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
+    # Accept photo and document
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_screenshot))
     asyncio.create_task(market_listener())
     asyncio.create_task(generate_signals(app))
     print("Bot running...")
