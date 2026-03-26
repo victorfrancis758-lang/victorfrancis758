@@ -1,1 +1,1 @@
-worker: ./railway_build.sh
+worker: sh ./railway_build.sh
