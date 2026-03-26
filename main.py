@@ -1,5 +1,5 @@
 # ======================================
-# AI TRADER SIGNAL SYSTEM - REAL MONEY READY
+# AI TRADER SIGNAL SYSTEM - SCREENSHOT READY
 # ======================================
 
 import os
@@ -10,14 +10,12 @@ import websockets
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
+import cv2
+import pytesseract
+from PIL import Image
+from io import BytesIO
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
-
-# For screenshot OCR
-from PIL import Image
-import io
-import pytesseract
-import requests
 
 # -------------------
 # CONFIG
@@ -70,7 +68,6 @@ async def market_listener():
         pairs = await fetch_all_pairs(ws)
         print(f"Monitoring {len(pairs)} symbols: {pairs}")
 
-        # Subscribe to all pairs
         for p in pairs:
             await ws.send(json.dumps({"ticks": p, "subscribe": 1}))
             market_volatility[p] = []
@@ -90,12 +87,11 @@ async def market_listener():
 # -------------------
 def analyze_pair(symbol, ticks):
     if len(ticks) < 10:
-        return None  # not enough data
+        return None
 
     series = np.array(ticks)
     ma = np.mean(series[-10:])
     last = series[-1]
-
     factor = adaptive_trend_factor.get(symbol, 1.0)
 
     if last > ma * (1 + 0.001*factor):
@@ -107,8 +103,6 @@ def analyze_pair(symbol, ticks):
 
     vol = np.std(series[-10:]) + 1e-5
     base = last
-
-    # Robust TP/SL calculation
     risk_multiplier = 50
     if direction == "BUY":
         sl = base - vol * risk_multiplier
@@ -178,6 +172,36 @@ Martingale: {martingale}
     save_trade(trade, martingale)
 
 # -------------------
+# HANDLE SCREENSHOTS
+# -------------------
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Please send a chart screenshot.")
+        return
+
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    img = Image.open(BytesIO(photo_bytes)).convert("RGB")
+    
+    # OCR
+    text = pytesseract.image_to_string(img)
+
+    # Parse symbol and last price from OCR
+    # (Assuming your screenshot shows something like "BTCUSD 26850.5")
+    try:
+        parts = text.strip().split()
+        symbol = parts[0]
+        last_price = float(parts[1])
+        trade = analyze_pair(symbol, [last_price]*10)  # replicate for analyze_pair
+        if trade:
+            await send_signal(trade, context)
+            await update.message.reply_text(f"✅ Signal generated for {symbol}")
+        else:
+            await update.message.reply_text("No valid signal found in the screenshot.")
+    except Exception as e:
+        await update.message.reply_text(f"Error processing screenshot: {e}")
+
+# -------------------
 # GENERATE SIGNALS LOOP
 # -------------------
 async def generate_signals(app):
@@ -201,7 +225,7 @@ async def generate_signals(app):
 # TELEGRAM HANDLERS
 # -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("AI Trading Signal Bot is active. Signals will appear automatically.")
+    await update.message.reply_text("AI Trading Signal Bot is active. Send chart screenshots to get signals.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -222,46 +246,13 @@ def update_last_result(result):
         csv.writer(f).writerows(rows)
 
 # -------------------
-# TELEGRAM SCREENSHOT HANDLER
-# -------------------
-async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        return
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    file_bytes = await file.download_as_bytearray()
-    image = Image.open(io.BytesIO(file_bytes))
-
-    # OCR extraction
-    text = pytesseract.image_to_string(image)
-    numbers = []
-    for line in text.splitlines():
-        for token in line.split():
-            try:
-                num = float(token.replace(",", "").replace("$",""))
-                numbers.append(num)
-            except:
-                continue
-
-    if not numbers:
-        await update.message.reply_text("⚠️ No valid numbers detected in the screenshot.")
-        return
-
-    last_price = numbers[-1]
-    trade = analyze_pair("SCREENSHOT:UNKNOWN", [last_price])
-    if trade:
-        await send_signal(trade, context)
-    else:
-        await update.message.reply_text("⚠️ Unable to generate signal from the screenshot.")
-
-# -------------------
 # MAIN
 # -------------------
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
+    app.add_handler(CallbackQueryHandler(handle_button))
     asyncio.create_task(market_listener())
     asyncio.create_task(generate_signals(app))
     print("Bot running...")
