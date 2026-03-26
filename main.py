@@ -90,7 +90,7 @@ async def market_listener():
 # -------------------
 def analyze_pair(symbol, ticks):
     if len(ticks) < 1:
-        return None  # Not enough data
+        return None
 
     series = np.array(ticks[-10:]) if len(ticks) >= 10 else np.array(ticks)
     ma = np.mean(series)
