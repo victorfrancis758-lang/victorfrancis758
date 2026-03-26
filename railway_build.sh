@@ -1,10 +1,6 @@
 #!/bin/bash
-# ----------------------------------------
-# Railway Build Script - Executes on deploy
-# ----------------------------------------
+# Make sure script is executable and installs dependencies
 
-# Upgrade pip and install dependencies
-python -m pip install --upgrade pip
+echo "Starting Railway build script..."
+pip install --upgrade pip
 pip install -r requirements.txt
-
-echo "Build script executed successfully."
