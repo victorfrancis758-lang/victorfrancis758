@@ -1,3 +1,2 @@
 #!/bin/bash
-pip install -r requirements.txt
-python main.py
+bash -c "pip install -r requirements.txt && python main.py"
