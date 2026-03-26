@@ -80,13 +80,14 @@ async def market_listener():
                 market_volatility[symbol].pop(0)
 
 # -------------------
-# SIGNAL GENERATION
+# SIGNAL GENERATION (TP/SL FIXED)
 # -------------------
 def analyze_pair(symbol, ticks):
     """
-    Very simple adaptive signal:
-    - Compare last tick vs moving average
-    - Determine trend and direction
+    Adaptive signal with proper TP/SL calculation:
+    - Trend based on last tick vs moving average
+    - TP/SL scaled to instrument volatility
+    - Works for Forex and Binary Options
     """
     if len(ticks) < 10:
         return None  # not enough data
@@ -105,15 +106,27 @@ def analyze_pair(symbol, ticks):
     else:
         return None
 
+    # Volatility-based TP/SL
     vol = np.std(series[-10:]) + 1e-5
     base = last
-    risk = vol * 50
+
+    # Scaling factor for binary options / forex
+    multiplier = 1.5  # can adjust for more conservative/aggressive TP
+    sl_distance = vol * 40  # realistic stop loss
+    tp_distance = sl_distance * multiplier
+
     if direction == "BUY":
-        sl = base - risk
-        tp = base + risk*2
+        sl = base - sl_distance
+        tp = base + tp_distance
     else:
-        sl = base + risk
-        tp = base - risk*2
+        sl = base + sl_distance
+        tp = base - tp_distance
+
+    # Minimal distance enforcement to prevent too tight TP/SL
+    min_distance = 0.5 if "CRYPTO" in symbol else 0.01
+    if abs(tp - sl) < min_distance:
+        tp = base + min_distance if direction == "BUY" else base - min_distance
+        sl = base - min_distance if direction == "BUY" else base + min_distance
 
     # Determine timeframe based on distance
     distance = abs(tp - sl)
@@ -181,12 +194,8 @@ async def generate_signals(app):
                     continue
                 cooldown_tracker[symbol] = now
 
-                # Send primary signal and Martingale 3 levels
+                # Send primary signal
                 await send_signal(trade, app, martingale=0)
-                for i in range(1,4):
-                    # Martingale entry: 2 min apart
-                    await asyncio.sleep(120)
-                    await send_signal(trade, app, martingale=i)
         await asyncio.sleep(5)  # small delay to loop again
 
 # -------------------
