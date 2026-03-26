@@ -1,18 +1,7 @@
-# Python Telegram Bot
 python-telegram-bot==20.4
-
-# WebSockets
 websockets==11.0.3
-
-# Numerical computations
 numpy==1.26.0
-
-# Image OCR
 pillow==10.1.0
 pytesseract==0.3.11
-
-# Timezone support
 pytz==2023.3
-
-# Requests for HTTP
 requests==2.31.0
