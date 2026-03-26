@@ -1,1 +1,1 @@
-worker: ./railway_build.sh
+worker: python main.py
