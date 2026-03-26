@@ -1,6 +1,5 @@
 # ======================================
 # AI TRADER SIGNAL SYSTEM - REAL MONEY READY
-# Supports Screenshots on Telegram
 # ======================================
 
 import os
@@ -14,7 +13,8 @@ import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 
-from PIL import Image, ImageEnhance
+# For screenshot OCR
+from PIL import Image
 import io
 import pytesseract
 import requests
@@ -36,7 +36,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","symbol","direction","tp","sl","timeframe","martingale","result"
+            "time","symbol","direction","tp","sl","timeframe","martingale","result","screenshot_numbers"
         ])
 
 # -------------------
@@ -70,6 +70,7 @@ async def market_listener():
         pairs = await fetch_all_pairs(ws)
         print(f"Monitoring {len(pairs)} symbols: {pairs}")
 
+        # Subscribe to all pairs
         for p in pairs:
             await ws.send(json.dumps({"ticks": p, "subscribe": 1}))
             market_volatility[p] = []
@@ -85,15 +86,16 @@ async def market_listener():
                 market_volatility[symbol].pop(0)
 
 # -------------------
-# SIGNAL GENERATION
+# SIGNAL GENERATION (TP/SL FIXED)
 # -------------------
 def analyze_pair(symbol, ticks):
     if len(ticks) < 1:
-        return None
+        return None  # Not enough data
 
     series = np.array(ticks[-10:]) if len(ticks) >= 10 else np.array(ticks)
     ma = np.mean(series)
     last = series[-1]
+
     factor = adaptive_trend_factor.get(symbol, 1.0)
 
     if last > ma * (1 + 0.001*factor):
@@ -144,17 +146,18 @@ def analyze_pair(symbol, ticks):
 # -------------------
 # SAVE TRADE
 # -------------------
-def save_trade(trade, martingale=0):
+def save_trade(trade, martingale=0, screenshot_numbers=None):
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([
             datetime.now(TIMEZONE), trade["symbol"], trade["direction"], trade["tp"], trade["sl"],
-            trade["timeframe"], martingale, "PENDING"
+            trade["timeframe"], martingale, "PENDING",
+            ",".join([str(n) for n in screenshot_numbers]) if screenshot_numbers else ""
         ])
 
 # -------------------
 # TELEGRAM SIGNAL
 # -------------------
-async def send_signal(trade, context, martingale=0):
+async def send_signal(trade, context, martingale=0, screenshot_numbers=None):
     keyboard = [
         [InlineKeyboardButton("✅ WIN", callback_data="win"),
          InlineKeyboardButton("❌ LOSS", callback_data="loss")]
@@ -170,7 +173,7 @@ Timeframe: {trade['timeframe']}
 Martingale: {martingale}
 """
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=reply_markup)
-    save_trade(trade, martingale)
+    save_trade(trade, martingale, screenshot_numbers)
 
 # -------------------
 # TELEGRAM HANDLERS
@@ -192,41 +195,32 @@ def update_last_result(result):
     rows = []
     with open(LOG_FILE, "r") as f:
         rows = list(csv.reader(f))
-    rows[-1][-1] = result
+    rows[-1][-2] = result
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerows(rows)
 
 # -------------------
-# OCR SCREENSHOT HANDLER
+# OCR SCREENSHOT HANDLER (IMPROVED)
 # -------------------
 async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file_bytes = None
-
-    # Accept photos or document images
-    if update.message.photo:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        file_bytes = await file.download_as_bytearray()
-    elif update.message.document:
-        doc = update.message.document
-        if doc.mime_type.startswith("image"):
-            file = await context.bot.get_file(doc.file_id)
-            file_bytes = await file.download_as_bytearray()
-    
-    if not file_bytes:
-        await update.message.reply_text("⚠️ Please send a photo or image file.")
+    if not update.message.photo:
+        await update.message.reply_text("⚠️ Please send a proper screenshot of a chart.")
         return
 
-    await update.message.reply_text("🖼️ Processing screenshot...")
+    # Get the highest resolution photo
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_bytes = await file.download_as_bytearray()
 
+    # Open image with PIL
     image = Image.open(io.BytesIO(file_bytes))
-    image = image.convert("L")  # grayscale
-    enhancer = ImageEnhance.Contrast(image)
-    image = enhancer.enhance(2)
 
+    # OCR extraction
     text = pytesseract.image_to_string(image)
     lines = text.splitlines()
     numbers = []
+
+    # Extract all float numbers from the OCR
     for line in lines:
         for token in line.split():
             try:
@@ -238,12 +232,15 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not numbers:
         await update.message.reply_text("⚠️ No valid numbers detected in the screenshot.")
         return
-    await update.message.reply_text(f"Numbers detected: {numbers}")
 
-    last_price = numbers[-1]
-    trade = analyze_pair("SCREENSHOT:UNKNOWN", [last_price])
+    # Use the **average of last 3 numbers** for signal generation
+    last_prices = numbers[-3:] if len(numbers) >= 3 else numbers
+    avg_price = sum(last_prices) / len(last_prices)
+
+    # Generate a trade signal using your existing analyze_pair logic
+    trade = analyze_pair("SCREENSHOT:UNKNOWN", [avg_price])
     if trade:
-        await send_signal(trade, context)
+        await send_signal(trade, context, screenshot_numbers=numbers)
     else:
         await update.message.reply_text("⚠️ Unable to generate signal from the screenshot.")
 
@@ -270,8 +267,7 @@ async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button))
-    # Accept photo and document
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_screenshot))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
     asyncio.create_task(market_listener())
     asyncio.create_task(generate_signals(app))
     print("Bot running...")
