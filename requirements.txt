@@ -3,4 +3,5 @@ websockets==11.0.3
 numpy==1.26.4
 pytz==2026.1
 Pillow==10.0.1
+requests==2.31.0
 pytesseract==0.3.13
