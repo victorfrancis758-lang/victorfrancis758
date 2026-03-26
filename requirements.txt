@@ -1,20 +1,6 @@
-# -------------------
-# AI Trader Bot Requirements
-# -------------------
-
-# Telegram Bot
 python-telegram-bot==20.6
-
-# WebSockets for Deriv feed
 websockets==11.0.3
-
-# Data & calculations
 numpy==1.26.4
 pytz==2026.1
-
-# OCR and image handling
 Pillow==10.0.1
-pytesseract==0.4.2
-
-# Async utilities
-nest-asyncio==1.5.6
+pytesseract==0.3.13
