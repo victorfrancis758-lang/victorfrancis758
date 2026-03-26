@@ -13,6 +13,12 @@ import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 
+# For screenshot OCR
+from PIL import Image
+import io
+import pytesseract
+import requests
+
 # -------------------
 # CONFIG
 # -------------------
@@ -80,14 +86,9 @@ async def market_listener():
                 market_volatility[symbol].pop(0)
 
 # -------------------
-# SIGNAL GENERATION
+# SIGNAL GENERATION (TP/SL FIXED)
 # -------------------
 def analyze_pair(symbol, ticks):
-    """
-    Very simple adaptive signal:
-    - Compare last tick vs moving average
-    - Determine trend and direction
-    """
     if len(ticks) < 10:
         return None  # not enough data
 
@@ -95,7 +96,6 @@ def analyze_pair(symbol, ticks):
     ma = np.mean(series[-10:])
     last = series[-1]
 
-    # adaptive weekly factor
     factor = adaptive_trend_factor.get(symbol, 1.0)
 
     if last > ma * (1 + 0.001*factor):
@@ -107,15 +107,25 @@ def analyze_pair(symbol, ticks):
 
     vol = np.std(series[-10:]) + 1e-5
     base = last
-    risk = vol * 50
-    if direction == "BUY":
-        sl = base - risk
-        tp = base + risk*2
-    else:
-        sl = base + risk
-        tp = base - risk*2
 
-    # Determine timeframe based on distance
+    # Robust TP/SL calculation
+    risk_multiplier = 50
+    if direction == "BUY":
+        sl = base - vol * risk_multiplier
+        tp = base + vol * risk_multiplier * 2
+    else:
+        sl = base + vol * risk_multiplier
+        tp = base - vol * risk_multiplier * 2
+
+    min_distance = 0.5 if "CRYPTO" in symbol else 0.01
+    if abs(tp - sl) < min_distance:
+        if direction == "BUY":
+            tp = base + min_distance
+            sl = base - min_distance
+        else:
+            tp = base - min_distance
+            sl = base + min_distance
+
     distance = abs(tp - sl)
     if distance <= 5:
         timeframe = "M1"
@@ -131,8 +141,8 @@ def analyze_pair(symbol, ticks):
     return {
         "symbol": symbol,
         "direction": direction,
-        "tp": round(tp,5),
-        "sl": round(sl,5),
+        "tp": round(tp, 5),
+        "sl": round(sl, 5),
         "timeframe": timeframe
     }
 
@@ -168,7 +178,7 @@ Martingale: {martingale}
     save_trade(trade, martingale)
 
 # -------------------
-# GENERATE SIGNALS LOOP (ALL SYMBOLS SIMULTANEOUSLY)
+# GENERATE SIGNALS LOOP
 # -------------------
 async def generate_signals(app):
     while True:
@@ -181,13 +191,11 @@ async def generate_signals(app):
                     continue
                 cooldown_tracker[symbol] = now
 
-                # Send primary signal and Martingale 3 levels
                 await send_signal(trade, app, martingale=0)
                 for i in range(1,4):
-                    # Martingale entry: 2 min apart
                     await asyncio.sleep(120)
                     await send_signal(trade, app, martingale=i)
-        await asyncio.sleep(5)  # small delay to loop again
+        await asyncio.sleep(5)
 
 # -------------------
 # TELEGRAM HANDLERS
@@ -214,12 +222,46 @@ def update_last_result(result):
         csv.writer(f).writerows(rows)
 
 # -------------------
+# TELEGRAM SCREENSHOT HANDLER
+# -------------------
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        return
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_bytes = await file.download_as_bytearray()
+    image = Image.open(io.BytesIO(file_bytes))
+
+    # OCR extraction
+    text = pytesseract.image_to_string(image)
+    numbers = []
+    for line in text.splitlines():
+        for token in line.split():
+            try:
+                num = float(token.replace(",", "").replace("$",""))
+                numbers.append(num)
+            except:
+                continue
+
+    if not numbers:
+        await update.message.reply_text("⚠️ No valid numbers detected in the screenshot.")
+        return
+
+    last_price = numbers[-1]
+    trade = analyze_pair("SCREENSHOT:UNKNOWN", [last_price])
+    if trade:
+        await send_signal(trade, context)
+    else:
+        await update.message.reply_text("⚠️ Unable to generate signal from the screenshot.")
+
+# -------------------
 # MAIN
 # -------------------
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
     asyncio.create_task(market_listener())
     asyncio.create_task(generate_signals(app))
     print("Bot running...")
