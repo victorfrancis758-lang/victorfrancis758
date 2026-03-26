@@ -2,6 +2,4 @@ python-telegram-bot==20.4
 websockets==11.0.3
 numpy==1.26.0
 pillow==10.1.0
-pytesseract==0.3.11
-pytz==2023.3
-requests==2.31.0
+pytesseract==0.3.10
